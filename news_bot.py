@@ -32,11 +32,16 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "REPLACE_WITH_YOUR_BOT_TOKEN")
 CHANNEL_ID = os.environ.get("CHANNEL_ID", "@your_channel_username")
 
 # منابع خبری RSS (می‌تونید فید بیشتری اضافه یا کم کنید)
+# هر فید یک دسته (category) و ایموجی مخصوص خودش داره که تو پیام تلگرام نمایش داده می‌شه
 RSS_FEEDS = [
-    "https://feeds.ign.com/ign/games-all",
-    "https://www.gamespot.com/feeds/game-news/",
-    "https://www.eurogamer.net/feed",
-    "https://www.pcgamer.com/rss/",
+    # --- اخبار گیم ---
+    {"url": "https://feeds.ign.com/ign/games-all", "emoji": "🎮", "label": "گیم"},
+    {"url": "https://www.gamespot.com/feeds/game-news/", "emoji": "🎮", "label": "گیم"},
+    {"url": "https://www.eurogamer.net/feed", "emoji": "🎮", "label": "گیم"},
+    {"url": "https://www.pcgamer.com/rss/", "emoji": "🎮", "label": "گیم"},
+    # --- اخبار انیمه ---
+    {"url": "https://www.animenewsnetwork.com/all/rss.xml?ann-edition=us", "emoji": "🎌", "label": "انیمه"},
+    {"url": "https://otakumode.com/news/feed", "emoji": "🎌", "label": "انیمه"},
 ]
 
 # هر چند ثانیه یک‌بار فیدها رو چک کنه
@@ -170,13 +175,13 @@ def send_text(caption: str) -> bool:
         return False
 
 
-def build_caption(title_fa: str, summary_fa: str, link: str) -> str:
-    caption = f"🎮 <b>{html.escape(title_fa)}</b>\n\n{html.escape(summary_fa)}\n\n🔗 <a href=\"{link}\">منبع خبر</a>"
+def build_caption(title_fa: str, summary_fa: str, link: str, emoji: str = "🎮") -> str:
+    caption = f"{emoji} <b>{html.escape(title_fa)}</b>\n\n{html.escape(summary_fa)}\n\n🔗 <a href=\"{link}\">منبع خبر</a>"
     # تلگرام کپشن عکس رو حداکثر ۱۰۲۴ کاراکتر قبول می‌کنه
     if len(caption) > 1000:
         allowed_summary_len = 1000 - len(title_fa) - len(link) - 60
         short_summary = summary_fa[: max(allowed_summary_len, 0)] + "…"
-        caption = f"🎮 <b>{html.escape(title_fa)}</b>\n\n{html.escape(short_summary)}\n\n🔗 <a href=\"{link}\">منبع خبر</a>"
+        caption = f"{emoji} <b>{html.escape(title_fa)}</b>\n\n{html.escape(short_summary)}\n\n🔗 <a href=\"{link}\">منبع خبر</a>"
     return caption
 
 
@@ -184,8 +189,12 @@ def process_feeds():
     sent_links = load_sent_links()
     new_items_found = 0
 
-    for feed_url in RSS_FEEDS:
-        log.info(f"در حال بررسی فید: {feed_url}")
+    for feed_info in RSS_FEEDS:
+        feed_url = feed_info["url"]
+        emoji = feed_info.get("emoji", "🎮")
+        label = feed_info.get("label", "خبر")
+
+        log.info(f"در حال بررسی فید {label}: {feed_url}")
         try:
             feed = feedparser.parse(feed_url)
         except Exception as e:
@@ -205,9 +214,9 @@ def process_feeds():
             summary_fa = translate_to_fa(summary)
             image_url = extract_image_url(entry)
 
-            caption = build_caption(title_fa, summary_fa, link)
+            caption = build_caption(title_fa, summary_fa, link, emoji)
 
-            log.info(f"در حال ارسال خبر: {title}")
+            log.info(f"در حال ارسال خبر ({label}): {title}")
 
             sent_ok = False
             if image_url:
