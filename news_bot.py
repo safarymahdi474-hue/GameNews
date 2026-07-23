@@ -26,6 +26,18 @@ from deep_translator import GoogleTranslator
 # توکن ربات تلگرام - از @BotFather بگیرید
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "REPLACE_WITH_YOUR_BOT_TOKEN")
 
+# کلید API آنتروپیک برای ترجمه با کیفیت بالا (اختیاری - نیاز به شارژ داره)
+# از https://console.anthropic.com بگیرید. اگه خالی باشه از Gemini یا گوگل ترنسلیت استفاده می‌شه.
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+
+# مدلی که برای ترجمه با Claude استفاده می‌شه
+TRANSLATION_MODEL = os.environ.get("TRANSLATION_MODEL", "claude-haiku-4-5-20251001")
+
+# کلید API رایگان گوگل جمینای برای ترجمه با کیفیت بالا و بدون هزینه
+# از https://aistudio.google.com/apikey بگیرید (نیاز به کارت بانکی نداره)
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+
 # آیدی یا یوزرنیم کانال مقصد
 # اگه کانال پابلیکه: "@yourchannel"
 # اگه پرایوته: عددی شبیه "-1001234567890" (ربات باید ادمین کانال باشه)
@@ -86,9 +98,95 @@ def clean_html(raw_html: str) -> str:
     return text
 
 
+TRANSLATION_SYSTEM_PROMPT = (
+    "You are a professional Persian (Farsi) translator for a gaming and anime news "
+    "Telegram channel. Translate the given English text into natural, fluent, "
+    "journalistic Persian that a native Persian gaming/anime fan would enjoy reading. "
+    "Keep game titles, anime titles, character names, and company/studio names in "
+    "their commonly-used form among Persian gaming/anime communities (often left in "
+    "Latin script or transliterated, whichever is more natural). Do not add any "
+    "commentary, notes, or explanations. Return ONLY the translated Persian text."
+)
+
+
+def translate_with_gemini(text: str) -> str | None:
+    """ترجمه رایگان با استفاده از Google Gemini API. اگه کلید ست نشده یا خطا داد None برمی‌گردونه."""
+    if not GEMINI_API_KEY or not text:
+        return None
+    try:
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+        )
+        payload = {
+            "systemInstruction": {"parts": [{"text": TRANSLATION_SYSTEM_PROMPT}]},
+            "contents": [{"parts": [{"text": text}]}],
+        }
+        r = requests.post(url, json=payload, timeout=30)
+        data = r.json()
+        if r.status_code != 200:
+            log.warning(f"خطای Gemini API (کد {r.status_code}): {data}")
+            return None
+        candidates = data.get("candidates", [])
+        if not candidates:
+            return None
+        parts = candidates[0].get("content", {}).get("parts", [])
+        translated = "".join(p.get("text", "") for p in parts).strip()
+        return translated or None
+    except Exception as e:
+        log.warning(f"خطا در ترجمه با Gemini: {e}")
+        return None
+
+
+def translate_with_claude(text: str) -> str | None:
+    """ترجمه با استفاده از Claude API برای کیفیت بالاتر (نیاز به شارژ). اگه کلید ست نشده یا خطا داد None برمی‌گردونه."""
+    if not ANTHROPIC_API_KEY or not text:
+        return None
+    try:
+        response = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": TRANSLATION_MODEL,
+                "max_tokens": 600,
+                "system": TRANSLATION_SYSTEM_PROMPT,
+                "messages": [{"role": "user", "content": text}],
+            },
+            timeout=30,
+        )
+        data = response.json()
+        if response.status_code != 200:
+            log.warning(f"خطای Claude API (کد {response.status_code}): {data}")
+            return None
+        parts = data.get("content", [])
+        translated = "".join(
+            p.get("text", "") for p in parts if p.get("type") == "text"
+        ).strip()
+        return translated or None
+    except Exception as e:
+        log.warning(f"خطا در ترجمه با Claude: {e}")
+        return None
+
+
 def translate_to_fa(text: str) -> str:
     if not text:
         return ""
+
+    # اول Gemini رو امتحان می‌کنیم (رایگان و کیفیت خوب)
+    gemini_result = translate_with_gemini(text)
+    if gemini_result:
+        return gemini_result
+
+    # بعد Claude (اگه کلیدش ست شده باشه - کیفیت بالاتر ولی نیاز به شارژ)
+    claude_result = translate_with_claude(text)
+    if claude_result:
+        return claude_result
+
+    # در نهایت به گوگل ترنسلیت ساده برمی‌گردیم (همیشه رایگان و بدون کلید)
     try:
         # گوگل ترنسلیت محدودیت طول داره، پس تیکه‌تیکه ترجمه می‌کنیم
         chunks = [text[i:i + 4000] for i in range(0, len(text), 4000)]
