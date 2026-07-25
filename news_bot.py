@@ -36,7 +36,7 @@ TRANSLATION_MODEL = os.environ.get("TRANSLATION_MODEL", "claude-haiku-4-5-202510
 # کلید API رایگان گوگل جمینای برای ترجمه با کیفیت بالا و بدون هزینه
 # از https://aistudio.google.com/apikey بگیرید (نیاز به کارت بانکی نداره)
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")
 
 # آیدی یا یوزرنیم کانال مقصد
 # اگه کانال پابلیکه: "@yourchannel"
@@ -57,7 +57,9 @@ RSS_FEEDS = [
 ]
 
 # هر چند ثانیه یک‌بار فیدها رو چک کنه
-CHECK_INTERVAL_SECONDS = 600  # هر ۱۰ دقیقه
+# نکته: چون هر چرخه حداکثر یک درخواست به AI می‌زنه، اگه با خطای ۴۲۹ (quota) مواجه شدید
+# این عدد رو بزرگ‌تر کنید (مثلاً ۳۶۰۰ برای هر ساعت) یا کمی صبر کنید تا سهمیه‌تون ریست بشه.
+CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL_SECONDS", "1800"))  # هر ۳۰ دقیقه
 
 # حداکثر تعداد خبر جدید از هر فید در هر بار چک کردن
 MAX_ITEMS_PER_FEED = 8
@@ -100,7 +102,8 @@ def clean_html(raw_html: str) -> str:
 
 ANALYSIS_SYSTEM_PROMPT = (
     "You are an editor for a Persian (Farsi) gaming and anime news Telegram channel. "
-    "For each news item you receive, do two things:\n"
+    "You will receive a JSON array of news items, each with an \"index\", \"title\", and "
+    "\"summary\". For EACH item, do two things:\n"
     "1. Decide if it is IMPORTANT enough to publish to a broad audience of gaming/anime fans.\n"
     "   IMPORTANT: major game/anime announcements, confirmed release dates, trailers for "
     "highly-anticipated titles, major updates/DLC/expansions, significant business news "
@@ -115,14 +118,15 @@ ANALYSIS_SYSTEM_PROMPT = (
     "titles, character names, and studio/company names in their commonly-used form among "
     "Persian gaming/anime communities (often left in Latin script or transliterated, "
     "whichever is more natural).\n\n"
-    "Respond with ONLY a raw JSON object, no markdown code fences, no extra text, in exactly "
-    "this shape:\n"
-    '{"important": true or false, "title_fa": "...", "summary_fa": "..."}\n'
-    "If important is false, you may leave title_fa and summary_fa as empty strings."
+    "Respond with ONLY a raw JSON array, no markdown code fences, no extra text, with one "
+    "object per input item, each in exactly this shape and in the SAME ORDER as the input:\n"
+    '[{"index": 0, "important": true or false, "title_fa": "...", "summary_fa": "..."}, ...]\n'
+    "If important is false for an item, you may leave its title_fa and summary_fa as empty "
+    "strings. The output array MUST have exactly as many objects as the input array."
 )
 
 
-def _parse_analysis_json(raw_text: str) -> dict | None:
+def _parse_analysis_array(raw_text: str, expected_len: int) -> list | None:
     if not raw_text:
         return None
     cleaned = raw_text.strip()
@@ -131,29 +135,32 @@ def _parse_analysis_json(raw_text: str) -> dict | None:
     cleaned = re.sub(r"```$", "", cleaned).strip()
     try:
         data = json.loads(cleaned)
-        if isinstance(data, dict) and "important" in data:
+        if isinstance(data, list) and len(data) == expected_len:
             return data
     except Exception:
         pass
     return None
 
 
-def analyze_with_gemini(title: str, summary: str) -> dict | None:
-    """با Gemini هم اهمیت خبر رو می‌سنجه هم ترجمه می‌کنه (رایگان)."""
-    if not GEMINI_API_KEY:
+def analyze_batch_with_gemini(items: list) -> list | None:
+    """با یک درخواست، همه‌ی خبرهای جدید رو با Gemini هم فیلتر و هم ترجمه می‌کنه (رایگان)."""
+    if not GEMINI_API_KEY or not items:
         return None
     try:
         url = (
             f"https://generativelanguage.googleapis.com/v1beta/models/"
             f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
         )
-        user_text = f"Title: {title}\nSummary: {summary}"
+        user_payload = [
+            {"index": i, "title": it["title"], "summary": it["summary"]}
+            for i, it in enumerate(items)
+        ]
         payload = {
             "systemInstruction": {"parts": [{"text": ANALYSIS_SYSTEM_PROMPT}]},
-            "contents": [{"parts": [{"text": user_text}]}],
+            "contents": [{"parts": [{"text": json.dumps(user_payload, ensure_ascii=False)}]}],
             "generationConfig": {"responseMimeType": "application/json"},
         }
-        r = requests.post(url, json=payload, timeout=30)
+        r = requests.post(url, json=payload, timeout=60)
         data = r.json()
         if r.status_code != 200:
             log.warning(f"خطای Gemini API (کد {r.status_code}): {data}")
@@ -163,18 +170,21 @@ def analyze_with_gemini(title: str, summary: str) -> dict | None:
             return None
         parts = candidates[0].get("content", {}).get("parts", [])
         raw_text = "".join(p.get("text", "") for p in parts).strip()
-        return _parse_analysis_json(raw_text)
+        return _parse_analysis_array(raw_text, len(items))
     except Exception as e:
-        log.warning(f"خطا در تحلیل با Gemini: {e}")
+        log.warning(f"خطا در تحلیل دسته‌ای با Gemini: {e}")
         return None
 
 
-def analyze_with_claude(title: str, summary: str) -> dict | None:
-    """با Claude هم اهمیت خبر رو می‌سنجه هم ترجمه می‌کنه (نیاز به شارژ)."""
-    if not ANTHROPIC_API_KEY:
+def analyze_batch_with_claude(items: list) -> list | None:
+    """با یک درخواست، همه‌ی خبرهای جدید رو با Claude هم فیلتر و هم ترجمه می‌کنه (نیاز به شارژ)."""
+    if not ANTHROPIC_API_KEY or not items:
         return None
     try:
-        user_text = f"Title: {title}\nSummary: {summary}"
+        user_payload = [
+            {"index": i, "title": it["title"], "summary": it["summary"]}
+            for i, it in enumerate(items)
+        ]
         response = requests.post(
             "https://api.anthropic.com/v1/messages",
             headers={
@@ -184,11 +194,13 @@ def analyze_with_claude(title: str, summary: str) -> dict | None:
             },
             json={
                 "model": TRANSLATION_MODEL,
-                "max_tokens": 700,
+                "max_tokens": 4000,
                 "system": ANALYSIS_SYSTEM_PROMPT,
-                "messages": [{"role": "user", "content": user_text}],
+                "messages": [
+                    {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)}
+                ],
             },
-            timeout=30,
+            timeout=60,
         )
         data = response.json()
         if response.status_code != 200:
@@ -198,9 +210,9 @@ def analyze_with_claude(title: str, summary: str) -> dict | None:
         raw_text = "".join(
             p.get("text", "") for p in parts if p.get("type") == "text"
         ).strip()
-        return _parse_analysis_json(raw_text)
+        return _parse_analysis_array(raw_text, len(items))
     except Exception as e:
-        log.warning(f"خطا در تحلیل با Claude: {e}")
+        log.warning(f"خطا در تحلیل دسته‌ای با Claude: {e}")
         return None
 
 
@@ -220,36 +232,49 @@ def passes_keyword_filter(title: str, summary: str) -> bool:
     return not any(keyword in combined for keyword in LOW_VALUE_KEYWORDS)
 
 
-def analyze_and_translate(title: str, summary: str) -> dict:
+def analyze_and_translate_batch(items: list) -> list:
     """
-    خروجی: {"important": bool, "title_fa": str, "summary_fa": str}
-    اول با Gemini، بعد Claude امتحان می‌کنه. اگه هیچ‌کدوم در دسترس نبودن،
-    با فیلتر کلیدواژه‌ای ساده + گوگل ترنسلیت پیش می‌ره.
+    ورودی: [{"title": ..., "summary": ...}, ...]
+    خروجی: [{"important": bool, "title_fa": str, "summary_fa": str}, ...] هم‌طول و هم‌ترتیب با ورودی
+
+    اول با یک درخواست دسته‌ای به Gemini، بعد Claude امتحان می‌کنه. اگه هیچ‌کدوم
+    در دسترس نبودن یا جواب معتبر ندادن، برای هر خبر با فیلتر کلیدواژه‌ای ساده +
+    گوگل ترنسلیت پیش می‌ره.
     """
-    result = analyze_with_gemini(title, summary)
-    if result is None:
-        result = analyze_with_claude(title, summary)
+    if not items:
+        return []
 
-    if result is not None:
-        return {
-            "important": bool(result.get("important", False)),
-            "title_fa": result.get("title_fa", "") or "",
-            "summary_fa": result.get("summary_fa", "") or "",
-        }
+    raw_result = analyze_batch_with_gemini(items)
+    if raw_result is None:
+        raw_result = analyze_batch_with_claude(items)
 
-    # --- حالت پشتیبان: بدون هوش مصنوعی ---
-    important = passes_keyword_filter(title, summary)
-    if not important:
-        return {"important": False, "title_fa": "", "summary_fa": ""}
+    if raw_result is not None:
+        results = []
+        for entry in raw_result:
+            results.append({
+                "important": bool(entry.get("important", False)),
+                "title_fa": entry.get("title_fa", "") or "",
+                "summary_fa": entry.get("summary_fa", "") or "",
+            })
+        return results
 
-    try:
-        title_fa = GoogleTranslator(source="auto", target="fa").translate(title)
-        summary_fa = GoogleTranslator(source="auto", target="fa").translate(summary[:4000])
-    except Exception as e:
-        log.warning(f"خطا در ترجمه: {e}")
-        title_fa, summary_fa = title, summary
-
-    return {"important": True, "title_fa": title_fa, "summary_fa": summary_fa}
+    # --- حالت پشتیبان: بدون هوش مصنوعی، تک‌تک با فیلتر کلیدواژه‌ای + گوگل ترنسلیت ---
+    log.warning("هوش مصنوعی در دسترس نبود؛ از فیلتر کلیدواژه‌ای و گوگل ترنسلیت استفاده می‌شه.")
+    results = []
+    for it in items:
+        title, summary = it["title"], it["summary"]
+        important = passes_keyword_filter(title, summary)
+        if not important:
+            results.append({"important": False, "title_fa": "", "summary_fa": ""})
+            continue
+        try:
+            title_fa = GoogleTranslator(source="auto", target="fa").translate(title)
+            summary_fa = GoogleTranslator(source="auto", target="fa").translate(summary[:4000])
+        except Exception as e:
+            log.warning(f"خطا در ترجمه: {e}")
+            title_fa, summary_fa = title, summary
+        results.append({"important": True, "title_fa": title_fa, "summary_fa": summary_fa})
+    return results
 
 
 def extract_image_url(entry) -> str | None:
@@ -340,6 +365,8 @@ def process_feeds():
     new_items_found = 0
     skipped_low_value = 0
 
+    # مرحله ۱: جمع‌آوری تمام خبرهای جدید از همه‌ی فیدها
+    candidates = []  # هر آیتم: {"entry":..., "link":..., "title":..., "summary":..., "emoji":..., "label":...}
     for feed_info in RSS_FEEDS:
         feed_url = feed_info["url"]
         emoji = feed_info.get("emoji", "🎮")
@@ -361,36 +388,58 @@ def process_feeds():
             raw_summary = entry.get("summary", "") or entry.get("description", "")
             summary = clean_html(raw_summary)[:600]
 
-            analysis = analyze_and_translate(title, summary)
+            candidates.append({
+                "entry": entry,
+                "link": link,
+                "title": title,
+                "summary": summary,
+                "emoji": emoji,
+                "label": label,
+            })
 
-            if not analysis["important"]:
-                log.info(f"رد شد (کم‌ارزش): {title}")
-                sent_links.add(link)  # دیگه دوباره بررسیش نکنه
-                skipped_low_value += 1
-                continue
+    if not candidates:
+        log.info("خبر جدیدی برای بررسی پیدا نشد.")
+        return
 
-            title_fa = analysis["title_fa"] or title
-            summary_fa = analysis["summary_fa"] or summary
-            image_url = extract_image_url(entry)
+    # مرحله ۲: تحلیل و ترجمه‌ی دسته‌ای همه‌ی کاندیدها با یک درخواست
+    log.info(f"در حال تحلیل {len(candidates)} خبر جدید...")
+    analyses = analyze_and_translate_batch(
+        [{"title": c["title"], "summary": c["summary"]} for c in candidates]
+    )
 
-            caption = build_caption(title_fa, summary_fa, link, emoji)
+    # مرحله ۳: ارسال خبرهای مهم به تلگرام
+    for candidate, analysis in zip(candidates, analyses):
+        link = candidate["link"]
+        title = candidate["title"]
 
-            log.info(f"در حال ارسال خبر ({label}): {title}")
+        if not analysis["important"]:
+            log.info(f"رد شد (کم‌ارزش): {title}")
+            sent_links.add(link)  # دیگه دوباره بررسیش نکنه
+            skipped_low_value += 1
+            continue
 
-            sent_ok = False
-            if image_url:
-                sent_ok = send_photo(image_url, caption)
-                if not sent_ok:
-                    # اگه عکس مشکل داشت، به‌صورت متنی بفرست
-                    sent_ok = send_text(caption)
-            else:
+        title_fa = analysis["title_fa"] or title
+        summary_fa = analysis["summary_fa"] or candidate["summary"]
+        image_url = extract_image_url(candidate["entry"])
+
+        caption = build_caption(title_fa, summary_fa, link, candidate["emoji"])
+
+        log.info(f"در حال ارسال خبر ({candidate['label']}): {title}")
+
+        sent_ok = False
+        if image_url:
+            sent_ok = send_photo(image_url, caption)
+            if not sent_ok:
+                # اگه عکس مشکل داشت، به‌صورت متنی بفرست
                 sent_ok = send_text(caption)
+        else:
+            sent_ok = send_text(caption)
 
-            if sent_ok:
-                sent_links.add(link)
-                new_items_found += 1
-                # کمی مکث بین پیام‌ها تا به محدودیت تلگرام نخوریم
-                time.sleep(3)
+        if sent_ok:
+            sent_links.add(link)
+            new_items_found += 1
+            # کمی مکث بین پیام‌ها تا به محدودیت تلگرام نخوریم
+            time.sleep(3)
 
     if new_items_found or skipped_low_value:
         save_sent_links(sent_links)
@@ -399,7 +448,7 @@ def process_feeds():
             f"{skipped_low_value} خبر کم‌ارزش رد شد."
         )
     else:
-        log.info("خبر جدیدی برای بررسی پیدا نشد.")
+        log.info("خبر جدیدی برای ارسال پیدا نشد.")
 
 
 def main():
