@@ -100,6 +100,64 @@ def clean_html(raw_html: str) -> str:
     return text
 
 
+def fetch_page_description(url: str) -> str:
+    """
+    وقتی فید هیچ خلاصه‌ای نداشت، از تگ‌های meta description / og:description
+    خود صفحه‌ی خبر استفاده می‌کنیم (تقریباً همه‌ی سایت‌های خبری این تگ رو دارن).
+    """
+    try:
+        r = requests.get(
+            url,
+            timeout=15,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; GameNewsBot/1.0)"},
+        )
+        if r.status_code != 200:
+            return ""
+        page_html = r.text[:200000]  # فقط بخش ابتدایی صفحه کافیه (تگ‌های meta تو <head> هستن)
+
+        patterns = [
+            r'<meta[^>]+property=["\']og:description["\'][^>]+content=["\']([^"\']+)["\']',
+            r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:description["\']',
+            r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']+)["\']',
+            r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']description["\']',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, page_html, re.IGNORECASE)
+            if match:
+                return html.unescape(match.group(1)).strip()
+    except Exception as e:
+        log.warning(f"خطا در گرفتن توضیحات از صفحه‌ی خبر: {e}")
+    return ""
+
+
+def extract_entry_summary(entry) -> str:
+    """
+    بعضی فیدها (مثل Anime News Network) به‌جای تگ استاندارد summary/description از
+    content:encoded یا تگ‌های دیگه استفاده می‌کنن. این تابع چند منبع رو امتحان می‌کنه.
+    """
+    # ۱. تگ استاندارد summary/description
+    for key in ("summary", "description"):
+        val = entry.get(key)
+        if val and clean_html(val):
+            return val
+
+    # ۲. content:encoded (feedparser این رو به‌صورت لیست تو entry.content می‌ذاره)
+    content_list = entry.get("content")
+    if content_list:
+        for c in content_list:
+            val = c.get("value", "")
+            if val and clean_html(val):
+                return val
+
+    # ۳. subtitle (بعضی فیدها از این استفاده می‌کنن)
+    val = entry.get("subtitle")
+    if val and clean_html(val):
+        return val
+
+    # ۴. tags/categories رو به‌عنوان آخرین راه‌حل به عنوان زمینه اضافه می‌کنیم (بهتر از هیچی)
+    return ""
+
+
 ANALYSIS_SYSTEM_PROMPT = (
     "You are an editor for a Persian (Farsi) gaming and anime news Telegram channel. "
     "You will receive a JSON array of news items, each with an \"index\", \"title\", and "
@@ -218,12 +276,45 @@ def analyze_batch_with_claude(items: list) -> list | None:
 
 # کلیدواژه‌هایی که در نبود هوش مصنوعی برای فیلتر کردن اخبار کم‌ارزش استفاده می‌شن
 LOW_VALUE_KEYWORDS = [
-    "best deals", "deal of the day", "% off", "discount", "sale ends",
-    "giveaway", "win a", "sweepstakes",
-    "best games to", "top 10", "top ten", "ranked", "ranking",
-    "review:", "our review", "hands-on", "hands on",
-    "how to", "guide:", "tips and tricks", "walkthrough",
-    "opinion:", "editorial:",
+    # --- تخفیف / فروش / پرومو ---
+    "deal", "deals", "% off", "discount", "coupon", "bundle sale",
+    "cheapest", "price drop", "on sale", "save $", "steam sale",
+    "amazon prime day", "black friday", "cyber monday", "sale ends",
+    "sale alert", "flash sale", "clearance", "free download",
+    "free this week", "epic games store free", "buy now",
+    "where to buy", "pre-order guide", "preorder guide",
+
+    # --- گیوآوی / مسابقه ---
+    "giveaway", "sweepstakes", "win a", "enter to win", "contest",
+    "raffle",
+
+    # --- لیست‌ها / رنکینگ ---
+    "top 10", "top ten", "top 5", "top five", "best of", "ranked",
+    "ranking", "every game", "everything you need to know",
+    "everything we know", "roundup", "recap", "definitive guide",
+    "ultimate guide", "complete list", "all the", "worth playing",
+    "games to play", "games you missed", "underrated games",
+
+    # --- ریویو / پیش‌نمایش / نظری ---
+    "review:", "our review", "hands-on", "hands on", "preview:",
+    "impressions", "we played", "opinion:", "editorial:", "op-ed",
+    "column:", "in defense of", "why i", "why you should",
+    "first look", "early access impressions", "our thoughts",
+    "is it worth", "should you buy", "should you play",
+
+    # --- آموزش / راهنما ---
+    "how to", "guide:", "tips and tricks", "walkthrough", "cheats",
+    "codes for", "redeem codes", "best settings", "best build",
+    "best loadout", "tier list", "best class", "beginner's guide",
+
+    # --- محتوای تعاملی/تبلیغاتی کم‌ارزش ---
+    "watch:", "video:", "livestream", "twitch stream", "let's play",
+    "unboxing", "reaction", "quiz:", "poll:", "which character are you",
+    "sponsored", "advertisement", "partner content", "in partnership with",
+    "promoted", "affiliate",
+
+    # --- زمان‌بندی/جزئیات فرعی (نه خبر اصلی) ---
+    "release time", "what time does", "how to watch", "how to stream",
 ]
 
 
@@ -385,8 +476,12 @@ def process_feeds():
                 continue
 
             title = entry.get("title", "").strip()
-            raw_summary = entry.get("summary", "") or entry.get("description", "")
+            raw_summary = extract_entry_summary(entry)
             summary = clean_html(raw_summary)[:600]
+
+            if not summary:
+                # اگه فید هیچ خلاصه‌ای نداشت، از خود صفحه‌ی خبر بگیر
+                summary = clean_html(fetch_page_description(link))[:600]
 
             candidates.append({
                 "entry": entry,
