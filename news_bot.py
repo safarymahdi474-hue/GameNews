@@ -98,29 +98,60 @@ def clean_html(raw_html: str) -> str:
     return text
 
 
-TRANSLATION_SYSTEM_PROMPT = (
-    "You are a professional Persian (Farsi) translator for a gaming and anime news "
-    "Telegram channel. Translate the given English text into natural, fluent, "
-    "journalistic Persian that a native Persian gaming/anime fan would enjoy reading. "
-    "Keep game titles, anime titles, character names, and company/studio names in "
-    "their commonly-used form among Persian gaming/anime communities (often left in "
-    "Latin script or transliterated, whichever is more natural). Do not add any "
-    "commentary, notes, or explanations. Return ONLY the translated Persian text."
+ANALYSIS_SYSTEM_PROMPT = (
+    "You are an editor for a Persian (Farsi) gaming and anime news Telegram channel. "
+    "For each news item you receive, do two things:\n"
+    "1. Decide if it is IMPORTANT enough to publish to a broad audience of gaming/anime fans.\n"
+    "   IMPORTANT: major game/anime announcements, confirmed release dates, trailers for "
+    "highly-anticipated titles, major updates/DLC/expansions, significant business news "
+    "(acquisitions, studio closures, major layoffs), award wins, major esports results, "
+    "platform-defining news.\n"
+    "   NOT IMPORTANT (reject): listicles/roundups ('10 best games...'), opinion/editorial "
+    "pieces, reviews, minor patch notes, sales/deals/discount promos, giveaways/contests, "
+    "unconfirmed rumors, how-to/guide articles, sponsored content, or anything with little "
+    "real news value.\n"
+    "2. If important, translate the title and summary into natural, fluent, journalistic "
+    "Persian that a native Persian gaming/anime fan would enjoy reading. Keep game/anime "
+    "titles, character names, and studio/company names in their commonly-used form among "
+    "Persian gaming/anime communities (often left in Latin script or transliterated, "
+    "whichever is more natural).\n\n"
+    "Respond with ONLY a raw JSON object, no markdown code fences, no extra text, in exactly "
+    "this shape:\n"
+    '{"important": true or false, "title_fa": "...", "summary_fa": "..."}\n'
+    "If important is false, you may leave title_fa and summary_fa as empty strings."
 )
 
 
-def translate_with_gemini(text: str) -> str | None:
-    """ترجمه رایگان با استفاده از Google Gemini API. اگه کلید ست نشده یا خطا داد None برمی‌گردونه."""
-    if not GEMINI_API_KEY or not text:
+def _parse_analysis_json(raw_text: str) -> dict | None:
+    if not raw_text:
+        return None
+    cleaned = raw_text.strip()
+    # حذف فنس‌های مارک‌داون اگه مدل با ```json برگردونده باشه
+    cleaned = re.sub(r"^```(?:json)?", "", cleaned).strip()
+    cleaned = re.sub(r"```$", "", cleaned).strip()
+    try:
+        data = json.loads(cleaned)
+        if isinstance(data, dict) and "important" in data:
+            return data
+    except Exception:
+        pass
+    return None
+
+
+def analyze_with_gemini(title: str, summary: str) -> dict | None:
+    """با Gemini هم اهمیت خبر رو می‌سنجه هم ترجمه می‌کنه (رایگان)."""
+    if not GEMINI_API_KEY:
         return None
     try:
         url = (
             f"https://generativelanguage.googleapis.com/v1beta/models/"
             f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
         )
+        user_text = f"Title: {title}\nSummary: {summary}"
         payload = {
-            "systemInstruction": {"parts": [{"text": TRANSLATION_SYSTEM_PROMPT}]},
-            "contents": [{"parts": [{"text": text}]}],
+            "systemInstruction": {"parts": [{"text": ANALYSIS_SYSTEM_PROMPT}]},
+            "contents": [{"parts": [{"text": user_text}]}],
+            "generationConfig": {"responseMimeType": "application/json"},
         }
         r = requests.post(url, json=payload, timeout=30)
         data = r.json()
@@ -131,18 +162,19 @@ def translate_with_gemini(text: str) -> str | None:
         if not candidates:
             return None
         parts = candidates[0].get("content", {}).get("parts", [])
-        translated = "".join(p.get("text", "") for p in parts).strip()
-        return translated or None
+        raw_text = "".join(p.get("text", "") for p in parts).strip()
+        return _parse_analysis_json(raw_text)
     except Exception as e:
-        log.warning(f"خطا در ترجمه با Gemini: {e}")
+        log.warning(f"خطا در تحلیل با Gemini: {e}")
         return None
 
 
-def translate_with_claude(text: str) -> str | None:
-    """ترجمه با استفاده از Claude API برای کیفیت بالاتر (نیاز به شارژ). اگه کلید ست نشده یا خطا داد None برمی‌گردونه."""
-    if not ANTHROPIC_API_KEY or not text:
+def analyze_with_claude(title: str, summary: str) -> dict | None:
+    """با Claude هم اهمیت خبر رو می‌سنجه هم ترجمه می‌کنه (نیاز به شارژ)."""
+    if not ANTHROPIC_API_KEY:
         return None
     try:
+        user_text = f"Title: {title}\nSummary: {summary}"
         response = requests.post(
             "https://api.anthropic.com/v1/messages",
             headers={
@@ -152,9 +184,9 @@ def translate_with_claude(text: str) -> str | None:
             },
             json={
                 "model": TRANSLATION_MODEL,
-                "max_tokens": 600,
-                "system": TRANSLATION_SYSTEM_PROMPT,
-                "messages": [{"role": "user", "content": text}],
+                "max_tokens": 700,
+                "system": ANALYSIS_SYSTEM_PROMPT,
+                "messages": [{"role": "user", "content": user_text}],
             },
             timeout=30,
         )
@@ -163,41 +195,61 @@ def translate_with_claude(text: str) -> str | None:
             log.warning(f"خطای Claude API (کد {response.status_code}): {data}")
             return None
         parts = data.get("content", [])
-        translated = "".join(
+        raw_text = "".join(
             p.get("text", "") for p in parts if p.get("type") == "text"
         ).strip()
-        return translated or None
+        return _parse_analysis_json(raw_text)
     except Exception as e:
-        log.warning(f"خطا در ترجمه با Claude: {e}")
+        log.warning(f"خطا در تحلیل با Claude: {e}")
         return None
 
 
-def translate_to_fa(text: str) -> str:
-    if not text:
-        return ""
+# کلیدواژه‌هایی که در نبود هوش مصنوعی برای فیلتر کردن اخبار کم‌ارزش استفاده می‌شن
+LOW_VALUE_KEYWORDS = [
+    "best deals", "deal of the day", "% off", "discount", "sale ends",
+    "giveaway", "win a", "sweepstakes",
+    "best games to", "top 10", "top ten", "ranked", "ranking",
+    "review:", "our review", "hands-on", "hands on",
+    "how to", "guide:", "tips and tricks", "walkthrough",
+    "opinion:", "editorial:",
+]
 
-    # اول Gemini رو امتحان می‌کنیم (رایگان و کیفیت خوب)
-    gemini_result = translate_with_gemini(text)
-    if gemini_result:
-        return gemini_result
 
-    # بعد Claude (اگه کلیدش ست شده باشه - کیفیت بالاتر ولی نیاز به شارژ)
-    claude_result = translate_with_claude(text)
-    if claude_result:
-        return claude_result
+def passes_keyword_filter(title: str, summary: str) -> bool:
+    combined = f"{title} {summary}".lower()
+    return not any(keyword in combined for keyword in LOW_VALUE_KEYWORDS)
 
-    # در نهایت به گوگل ترنسلیت ساده برمی‌گردیم (همیشه رایگان و بدون کلید)
+
+def analyze_and_translate(title: str, summary: str) -> dict:
+    """
+    خروجی: {"important": bool, "title_fa": str, "summary_fa": str}
+    اول با Gemini، بعد Claude امتحان می‌کنه. اگه هیچ‌کدوم در دسترس نبودن،
+    با فیلتر کلیدواژه‌ای ساده + گوگل ترنسلیت پیش می‌ره.
+    """
+    result = analyze_with_gemini(title, summary)
+    if result is None:
+        result = analyze_with_claude(title, summary)
+
+    if result is not None:
+        return {
+            "important": bool(result.get("important", False)),
+            "title_fa": result.get("title_fa", "") or "",
+            "summary_fa": result.get("summary_fa", "") or "",
+        }
+
+    # --- حالت پشتیبان: بدون هوش مصنوعی ---
+    important = passes_keyword_filter(title, summary)
+    if not important:
+        return {"important": False, "title_fa": "", "summary_fa": ""}
+
     try:
-        # گوگل ترنسلیت محدودیت طول داره، پس تیکه‌تیکه ترجمه می‌کنیم
-        chunks = [text[i:i + 4000] for i in range(0, len(text), 4000)]
-        translated_chunks = [
-            GoogleTranslator(source="auto", target="fa").translate(chunk)
-            for chunk in chunks
-        ]
-        return " ".join(translated_chunks)
+        title_fa = GoogleTranslator(source="auto", target="fa").translate(title)
+        summary_fa = GoogleTranslator(source="auto", target="fa").translate(summary[:4000])
     except Exception as e:
         log.warning(f"خطا در ترجمه: {e}")
-        return text  # اگه ترجمه شکست خورد، متن اصلی رو برمی‌گردونیم
+        title_fa, summary_fa = title, summary
+
+    return {"important": True, "title_fa": title_fa, "summary_fa": summary_fa}
 
 
 def extract_image_url(entry) -> str | None:
@@ -286,6 +338,7 @@ def build_caption(title_fa: str, summary_fa: str, link: str, emoji: str = "🎮"
 def process_feeds():
     sent_links = load_sent_links()
     new_items_found = 0
+    skipped_low_value = 0
 
     for feed_info in RSS_FEEDS:
         feed_url = feed_info["url"]
@@ -308,8 +361,16 @@ def process_feeds():
             raw_summary = entry.get("summary", "") or entry.get("description", "")
             summary = clean_html(raw_summary)[:600]
 
-            title_fa = translate_to_fa(title)
-            summary_fa = translate_to_fa(summary)
+            analysis = analyze_and_translate(title, summary)
+
+            if not analysis["important"]:
+                log.info(f"رد شد (کم‌ارزش): {title}")
+                sent_links.add(link)  # دیگه دوباره بررسیش نکنه
+                skipped_low_value += 1
+                continue
+
+            title_fa = analysis["title_fa"] or title
+            summary_fa = analysis["summary_fa"] or summary
             image_url = extract_image_url(entry)
 
             caption = build_caption(title_fa, summary_fa, link, emoji)
@@ -331,11 +392,14 @@ def process_feeds():
                 # کمی مکث بین پیام‌ها تا به محدودیت تلگرام نخوریم
                 time.sleep(3)
 
-    if new_items_found:
+    if new_items_found or skipped_low_value:
         save_sent_links(sent_links)
-        log.info(f"مجموعاً {new_items_found} خبر جدید ارسال شد.")
+        log.info(
+            f"مجموعاً {new_items_found} خبر مهم ارسال شد، "
+            f"{skipped_low_value} خبر کم‌ارزش رد شد."
+        )
     else:
-        log.info("خبر جدیدی برای ارسال پیدا نشد.")
+        log.info("خبر جدیدی برای بررسی پیدا نشد.")
 
 
 def main():
