@@ -441,7 +441,33 @@ def send_text(caption: str) -> bool:
         return False
 
 
+# الگویی برای پیدا کردن بخش‌های لاتین/عددی داخل متن فارسی (اسم بازی، تاریخ، عدد و ...)
+LATIN_RUN_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9 .,'\-:/&+()]*[A-Za-z0-9]|[A-Za-z0-9]")
+
+
+def fix_persian_rtl(text: str) -> str:
+    """
+    شبیه اکستنشن‌های راست‌چین‌کننده‌ی فارسی: با اضافه‌کردن نشانه‌های نامرئی جهت‌دهی
+    یونیکد، مطمئن می‌شه متنی که کلمات/اعداد لاتین (اسم بازی، تاریخ و...) وسطش
+    هست، درست و راست‌به‌چپ نمایش داده بشه و ترتیب کلمات به‌هم نریزه.
+    """
+    if not text:
+        return text
+
+    def wrap(match):
+        # هر بخش لاتین/عددی رو با ایزوله‌ی جهت چپ‌به‌راست (LRI...PDI) احاطه می‌کنیم
+        # تا الگوریتم bidi تلگرام نظمش رو با متن فارسی اطراف به‌هم نریزه
+        return "\u2066" + match.group(0) + "\u2069"
+
+    text = LATIN_RUN_PATTERN.sub(wrap, text)
+    # علامت راست‌به‌چپ (RLM) در ابتدای متن، تا جهت کلی پاراگراف قطعاً راست‌به‌چپ باشه
+    # (مخصوصاً وقتی خط با ایموجی یا کلمه‌ی لاتین شروع می‌شه)
+    return "\u200f" + text
+
+
 def build_caption(title_fa: str, summary_fa: str, link: str, emoji: str = "🎮") -> str:
+    title_fa = fix_persian_rtl(title_fa)
+    summary_fa = fix_persian_rtl(summary_fa)
     caption = f"{emoji} <b>{html.escape(title_fa)}</b>\n\n{html.escape(summary_fa)}\n\n🔗 <a href=\"{link}\">منبع خبر</a>"
     # تلگرام کپشن عکس رو حداکثر ۱۰۲۴ کاراکتر قبول می‌کنه
     if len(caption) > 1000:
