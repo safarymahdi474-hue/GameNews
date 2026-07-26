@@ -55,13 +55,8 @@ REPOST_COMMAND = os.environ.get("REPOST_COMMAND", "/post")
 # خطی که به‌جای خط «منبع خبر» جایگزین می‌شه و داخل نقل‌قول قرار می‌گیره
 ATTRIBUTION_LINE = os.environ.get("ATTRIBUTION_LINE", "𝐈𝐃 : @HiromiyaStudio")
 
-# آیدی عددی کاربرهایی که اجازه دارن از دستور /post استفاده کنن (با کاما جدا کنید)
-# خالی بذارید یعنی هرکسی تو گروه بتونه از این دستور استفاده کنه (توصیه نمی‌شه)
-# آیدی عددی خودتون رو می‌تونید از @userinfobot بگیرید
-_allowed_ids_raw = os.environ.get("ALLOWED_USER_IDS", "")
-ALLOWED_USER_IDS = {
-    int(x.strip()) for x in _allowed_ids_raw.split(",") if x.strip().isdigit()
-}
+# نکته: دستور /post برای همه‌ی اعضای گروه پیش‌نویس (DRAFT_GROUP_ID) فعاله؛
+# محدودیتی بر اساس آیدی کاربر وجود نداره، فقط باید داخل همون گروه زده بشه.
 
 # منابع خبری RSS (می‌تونید فید بیشتری اضافه یا کم کنید)
 # هر فید یک دسته (category) و ایموجی مخصوص خودش داره که تو پیام تلگرام نمایش داده می‌شه
@@ -632,13 +627,13 @@ def build_repost_caption(original_text: str) -> str:
 
 def handle_repost_command(message: dict) -> None:
     chat_id = message["chat"]["id"]
-    sender = message.get("from", {}) or {}
-    sender_id = sender.get("id")
-    sender_name = sender.get("username") or sender.get("first_name") or str(sender_id)
 
-    if ALLOWED_USER_IDS and sender_id not in ALLOWED_USER_IDS:
-        log.warning(f"کاربر غیرمجاز ({sender_name} / {sender_id}) سعی کرد از دستور {REPOST_COMMAND} استفاده کنه.")
+    # فقط داخل خود گروه پیش‌نویس این دستور کار کنه (نه تو چت خصوصی یا جای دیگه)
+    if str(chat_id) != str(DRAFT_GROUP_ID):
         return
+
+    sender = message.get("from", {}) or {}
+    sender_name = sender.get("username") or sender.get("first_name") or str(sender.get("id"))
 
     reply_to = message.get("reply_to_message")
     if not reply_to:
