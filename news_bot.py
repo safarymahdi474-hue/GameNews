@@ -14,6 +14,7 @@ import html
 import json
 import time
 import logging
+import threading
 
 import feedparser
 import requests
@@ -38,10 +39,29 @@ TRANSLATION_MODEL = os.environ.get("TRANSLATION_MODEL", "claude-haiku-4-5-202510
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")
 
-# آیدی یا یوزرنیم کانال مقصد
+# آیدی یا یوزرنیم کانال نهایی که با دستور /post خبر تاییدشده توش منتشر می‌شه
 # اگه کانال پابلیکه: "@yourchannel"
 # اگه پرایوته: عددی شبیه "-1001234567890" (ربات باید ادمین کانال باشه)
 CHANNEL_ID = os.environ.get("CHANNEL_ID", "@your_channel_username")
+
+# آیدی گروهی که اخبار خام/پیش‌نویس اول توش پست می‌شن تا بررسی و تایید بشن
+# ربات باید عضو این گروه باشه (لازم نیست ادمین باشه، فقط باید بتونه پیام بفرسته و بخونه)
+# برای پیدا کردن آیدی گروه: یه پیام تو گروه بفرستید و با @JsonDumpBot یا مشابه chat.id رو پیدا کنید
+DRAFT_GROUP_ID = os.environ.get("DRAFT_GROUP_ID", "REPLACE_WITH_YOUR_GROUP_ID")
+
+# دستوری که با ریپلای‌کردن روی خبر و زدنش، اون خبر رو به کانال نهایی می‌فرسته
+REPOST_COMMAND = os.environ.get("REPOST_COMMAND", "/post")
+
+# خطی که به‌جای خط «منبع خبر» جایگزین می‌شه و داخل نقل‌قول قرار می‌گیره
+ATTRIBUTION_LINE = os.environ.get("ATTRIBUTION_LINE", "𝐈𝐃 : @HiromiyaStudio")
+
+# آیدی عددی کاربرهایی که اجازه دارن از دستور /post استفاده کنن (با کاما جدا کنید)
+# خالی بذارید یعنی هرکسی تو گروه بتونه از این دستور استفاده کنه (توصیه نمی‌شه)
+# آیدی عددی خودتون رو می‌تونید از @userinfobot بگیرید
+_allowed_ids_raw = os.environ.get("ALLOWED_USER_IDS", "")
+ALLOWED_USER_IDS = {
+    int(x.strip()) for x in _allowed_ids_raw.split(",") if x.strip().isdigit()
+}
 
 # منابع خبری RSS (می‌تونید فید بیشتری اضافه یا کم کنید)
 # هر فید یک دسته (category) و ایموجی مخصوص خودش داره که تو پیام تلگرام نمایش داده می‌شه
@@ -401,11 +421,12 @@ def extract_image_url(entry) -> str | None:
     return None
 
 
-def send_photo(image_url: str, caption: str) -> bool:
+def send_photo(chat_id: str, photo_source: str, caption: str) -> bool:
+    """photo_source می‌تونه یه URL باشه یا یه file_id تلگرامی (برای ریپست عکس‌های موجود)."""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
     payload = {
-        "chat_id": CHANNEL_ID,
-        "photo": image_url,
+        "chat_id": chat_id,
+        "photo": photo_source,
         "caption": caption,
         "parse_mode": "HTML",
     }
@@ -421,10 +442,10 @@ def send_photo(image_url: str, caption: str) -> bool:
         return False
 
 
-def send_text(caption: str) -> bool:
+def send_text(chat_id: str, caption: str) -> bool:
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {
-        "chat_id": CHANNEL_ID,
+        "chat_id": chat_id,
         "text": caption,
         "parse_mode": "HTML",
         "disable_web_page_preview": False,
@@ -549,12 +570,12 @@ def process_feeds():
 
         sent_ok = False
         if image_url:
-            sent_ok = send_photo(image_url, caption)
+            sent_ok = send_photo(DRAFT_GROUP_ID, image_url, caption)
             if not sent_ok:
                 # اگه عکس مشکل داشت، به‌صورت متنی بفرست
-                sent_ok = send_text(caption)
+                sent_ok = send_text(DRAFT_GROUP_ID, caption)
         else:
-            sent_ok = send_text(caption)
+            sent_ok = send_text(DRAFT_GROUP_ID, caption)
 
         if sent_ok:
             sent_links.add(link)
@@ -572,12 +593,122 @@ def process_feeds():
         log.info("خبر جدیدی برای ارسال پیدا نشد.")
 
 
+def get_updates(offset: int | None = None, timeout: int = 25) -> list:
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
+    params = {"timeout": timeout, "allowed_updates": json.dumps(["message"])}
+    if offset is not None:
+        params["offset"] = offset
+    try:
+        r = requests.get(url, params=params, timeout=timeout + 10)
+        data = r.json()
+        if not data.get("ok"):
+            log.warning(f"خطا در getUpdates: {data}")
+            return []
+        return data.get("result", [])
+    except Exception as e:
+        log.warning(f"خطا در دریافت آپدیت‌ها: {e}")
+        return []
+
+
+def build_repost_caption(original_text: str) -> str:
+    """
+    خط آخر (منبع خبر) رو از متن اصلی حذف می‌کنه و به‌جاش خط ATTRIBUTION_LINE رو
+    به‌صورت نقل‌قول (blockquote) اضافه می‌کنه. توجه: تلگرام فرمت (بولد و ...) رو
+    به‌صورت entities جدا نگه می‌داره نه تو خود متن، پس متنی که این تابع می‌گیره
+    خامه و فرمت اصلی (بولد عنوان) حفظ نمی‌شه؛ ولی محتوا و ساختار خطوط دست‌نخورده‌ست.
+    """
+    lines = (original_text or "").split("\n")
+    # از آخر خط‌های خالی و خط منبع خبر رو حذف کن
+    while lines and (
+        lines[-1].strip() == ""
+        or "منبع خبر" in lines[-1]
+        or lines[-1].strip().startswith("🔗")
+    ):
+        lines.pop()
+    content = "\n".join(lines).rstrip()
+    new_caption = f"{html.escape(content)}\n\n<blockquote>{html.escape(ATTRIBUTION_LINE)}</blockquote>"
+    return new_caption
+
+
+def handle_repost_command(message: dict) -> None:
+    chat_id = message["chat"]["id"]
+    sender = message.get("from", {}) or {}
+    sender_id = sender.get("id")
+    sender_name = sender.get("username") or sender.get("first_name") or str(sender_id)
+
+    if ALLOWED_USER_IDS and sender_id not in ALLOWED_USER_IDS:
+        log.warning(f"کاربر غیرمجاز ({sender_name} / {sender_id}) سعی کرد از دستور {REPOST_COMMAND} استفاده کنه.")
+        return
+
+    reply_to = message.get("reply_to_message")
+    if not reply_to:
+        send_text(
+            chat_id,
+            f"برای استفاده از {html.escape(REPOST_COMMAND)} باید روی پیام خبر مورد نظر ریپلای کنید.",
+        )
+        return
+
+    original_text = reply_to.get("caption") or reply_to.get("text") or ""
+    new_caption = build_repost_caption(original_text)
+
+    photos = reply_to.get("photo")
+    sent_ok = False
+    if photos:
+        file_id = photos[-1]["file_id"]  # بزرگ‌ترین سایز عکس، آخرین آیتم لیسته
+        sent_ok = send_photo(CHANNEL_ID, file_id, new_caption)
+    else:
+        sent_ok = send_text(CHANNEL_ID, new_caption)
+
+    if sent_ok:
+        log.info(f"خبر با دستور {sender_name} به کانال ارسال شد.")
+        send_text(chat_id, "✅ خبر با موفقیت به کانال ارسال شد.")
+    else:
+        send_text(chat_id, "❌ ارسال خبر به کانال با خطا مواجه شد.")
+
+
+def handle_update(update: dict) -> None:
+    message = update.get("message")
+    if not message:
+        return
+    text = (message.get("text") or "").strip()
+    if text != REPOST_COMMAND:
+        return
+    try:
+        handle_repost_command(message)
+    except Exception as e:
+        log.warning(f"خطا در پردازش دستور ریپست: {e}")
+
+
+def command_listener_loop() -> None:
+    """تو یه ترد جدا به‌صورت مداوم به دستورهای ریپلای/کامند تلگرام گوش می‌ده."""
+    log.info(f"گوش‌دادن به دستور {REPOST_COMMAND} شروع شد...")
+
+    # اول بک‌لاگ آپدیت‌های قدیمی رو رد می‌کنیم تا بعد از هر ری‌استارت، دستورهای قدیمی اجرا نشن
+    offset = None
+    backlog = get_updates(offset=None, timeout=1)
+    if backlog:
+        offset = backlog[-1]["update_id"] + 1
+
+    while True:
+        updates = get_updates(offset=offset, timeout=25)
+        for update in updates:
+            offset = update["update_id"] + 1
+            handle_update(update)
+
+
 def main():
     if BOT_TOKEN.startswith("REPLACE_WITH"):
         log.error("لطفاً ابتدا BOT_TOKEN و CHANNEL_ID رو در تنظیمات وارد کنید.")
         return
+    if DRAFT_GROUP_ID.startswith("REPLACE_WITH"):
+        log.error("لطفاً ابتدا DRAFT_GROUP_ID رو در تنظیمات وارد کنید (آیدی گروه پیش‌نویس).")
+        return
 
     log.info("ربات اخبار گیم شروع به کار کرد...")
+
+    listener_thread = threading.Thread(target=command_listener_loop, daemon=True)
+    listener_thread.start()
+
     while True:
         try:
             process_feeds()
