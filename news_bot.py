@@ -1,44 +1,46 @@
 """
-ربات اخبار گیم فارسی برای تلگرام — نسخه‌ی خودکار با Gemini
-------------------------------------------------------------
-این نسخه به‌طور کامل خودکار عمل می‌کنه:
+ربات اخبار گیم فارسی برای تلگرام — نسخه‌ی Gemini + تأیید پیش‌نویس
+--------------------------------------------------------------------
+جریان کار:
 1) از فیدهای RSS سایت‌های خبری گیم (IGN, GameSpot, Eurogamer, PC Gamer)
-   جدیدترین خبرها رو می‌گیره (اخبار انیمه دیگه پیگیری نمی‌شه).
+   جدیدترین خبرها رو می‌گیره (اخبار انیمه پیگیری نمی‌شه).
 2) هر خبر رو به Gemini می‌ده تا:
    - تشخیص بده خبر ارزش انتشار داره یا نه (تخفیف/لیست/ریویو صرف = رد بشه)
-   - عنوان و متن رو به فارسیِ روان، جذاب و با لحن خبری-هیجانی بازنویسی کنه
-   - چند هشتگ مرتبط فارسی/انگلیسی پیشنهاد بده
-3) عکس خبر رو (از خود فید یا og:image صفحه) پیدا می‌کنه.
-4) یک استیکر گیمینگ تصادفی (از پک‌های تنظیم‌شده) + عکس خبر + کپشن جذاب رو
-   مستقیم به کانال تنظیم‌شده می‌فرسته.
-5) برای جلوگیری از تکرار، لینک خبرهای فرستاده‌شده رو تو sent_news.json نگه می‌داره.
+   - عنوان و متن رو به فارسیِ روان، جذاب و با ایموجی‌های کیبورد بازنویسی کنه
+   - چند هشتگ مرتبط پیشنهاد بده
+3) عکس خبر رو پیدا می‌کنه.
+4) به‌جای ارسال مستقیم، خبرِ آماده رو به‌عنوان **پیش‌نویس** به گروه پیش‌نویس
+   (DRAFT_GROUP_ID) می‌فرسته.
+5) هر عضو گروه با ریپلای‌کردن روی همون پیش‌نویس و نوشتن دستور /post، خبر رو
+   (همراه با یک استیکر گیمینگ تصادفی) به کانال اصلی (CHANNEL_ID) منتشر می‌کنه.
+6) برای جلوگیری از پردازش دوباره‌ی یک خبر، لینک خبرهای بررسی‌شده تو
+   sent_news.json نگه داشته می‌شه. پیش‌نویس‌های در انتظار تأیید هم تو
+   pending_drafts.json ذخیره می‌شن تا با ری‌استارت ربات از دست نرن.
 
-نکته: این نسخه دیگه نیازی به «گروه پیش‌نویس» و دستور /post نداره؛ همه‌چیز خودکاره.
-اگه هنوز می‌خوای قبل از انتشار خبرها رو تأیید کنی، می‌تونی DRY_RUN=1 بذاری تا
-فقط تو ترمینال چاپ بشن و به کانال ارسال نشن.
+با DRY_RUN=1 می‌تونی بدون ارسال واقعی، فقط تو کنسول ببینی خروجی چطوریه.
 """
 
 import os
 import json
 import random
-import asyncio
 import logging
 import re
-from datetime import datetime, timezone
 
 import feedparser
 import requests
 from bs4 import BeautifulSoup
 import google.generativeai as genai
-from telegram import Bot
+from telegram import Update
 from telegram.error import TelegramError
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ---------------------------------------------------------------------------
 # تنظیمات
 # ---------------------------------------------------------------------------
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-CHANNEL_ID = os.environ["CHANNEL_ID"]                       # مثل @yourchannel یا -100...
+CHANNEL_ID = os.environ["CHANNEL_ID"]                        # کانال نهایی: @yourchannel یا -100...
+DRAFT_GROUP_ID = os.environ["DRAFT_GROUP_ID"]                # گروه پیش‌نویس برای تأیید خبرها
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
 # اسم کوتاه پک‌های استیکر گیمینگ (بخش بعد از t.me/addstickers/ ) — با کاما جدا کن
@@ -46,16 +48,18 @@ STICKER_PACK_NAMES = [
     s.strip() for s in os.environ.get("STICKER_PACK_NAMES", "").split(",") if s.strip()
 ]
 
-# هر چند دقیقه یک‌بار چک کنه (پیش‌فرض ۱۵ دقیقه)
+# اختیاری: اگه بخوای فقط آیدی‌های خاصی اجازه‌ی /post داشته باشن (با کاما جدا کن)
+# خالی بذاری یعنی هر عضو گروه پیش‌نویس می‌تونه تأیید کنه.
+ALLOWED_APPROVER_IDS = {
+    int(x) for x in os.environ.get("ALLOWED_APPROVER_IDS", "").split(",") if x.strip().isdigit()
+}
+
 CHECK_INTERVAL_MINUTES = int(os.environ.get("CHECK_INTERVAL_MINUTES", "15"))
-
-# حداکثر چند خبر تو هر دور بررسی بشه (برای رعایت محدودیت رایگان Gemini)
 MAX_ITEMS_PER_RUN = int(os.environ.get("MAX_ITEMS_PER_RUN", "5"))
-
-# اگه ۱ باشه، به‌جای ارسال واقعی فقط تو کنسول چاپ می‌کنه (تست بدون ریسک)
 DRY_RUN = os.environ.get("DRY_RUN", "0") == "1"
 
 SENT_NEWS_FILE = "sent_news.json"
+PENDING_DRAFTS_FILE = "pending_drafts.json"
 
 RSS_FEEDS = {
     "IGN": "https://feeds.ign.com/ign/games-all",
@@ -75,25 +79,39 @@ log = logging.getLogger("gamenews-bot")
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel(GEMINI_MODEL_NAME)
 
-bot = Bot(token=BOT_TOKEN)
+# ---------------------------------------------------------------------------
+# ذخیره‌سازی روی دیسک
+# ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# ذخیره‌سازی لینک‌های ارسال‌شده
-# ---------------------------------------------------------------------------
+def _load_json(path: str, default):
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            log.warning("فایل %s خراب بود، از صفر شروع می‌کنیم.", path)
+    return default
+
+
+def _save_json(path: str, data) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
 
 def load_sent_links() -> set:
-    if os.path.exists(SENT_NEWS_FILE):
-        try:
-            with open(SENT_NEWS_FILE, "r", encoding="utf-8") as f:
-                return set(json.load(f))
-        except (json.JSONDecodeError, OSError):
-            log.warning("فایل sent_news.json خراب بود، از صفر شروع می‌کنیم.")
-    return set()
+    return set(_load_json(SENT_NEWS_FILE, []))
 
 
 def save_sent_links(links: set) -> None:
-    with open(SENT_NEWS_FILE, "w", encoding="utf-8") as f:
-        json.dump(sorted(links), f, ensure_ascii=False, indent=2)
+    _save_json(SENT_NEWS_FILE, sorted(links))
+
+
+def load_pending_drafts() -> dict:
+    return _load_json(PENDING_DRAFTS_FILE, {})
+
+
+def save_pending_drafts(drafts: dict) -> None:
+    _save_json(PENDING_DRAFTS_FILE, drafts)
 
 
 # ---------------------------------------------------------------------------
@@ -101,12 +119,11 @@ def save_sent_links(links: set) -> None:
 # ---------------------------------------------------------------------------
 
 def fetch_latest_entries() -> list:
-    """جدیدترین خبر هر منبع رو برمی‌گردونه (چندتا آیتم از هر فید)."""
     entries = []
     for source_name, url in RSS_FEEDS.items():
         try:
             parsed = feedparser.parse(url)
-            for entry in parsed.entries[:3]:  # ۳ خبر اول هر منبع کافیه
+            for entry in parsed.entries[:3]:
                 entries.append({
                     "source": source_name,
                     "title": entry.get("title", "").strip(),
@@ -123,7 +140,6 @@ def fetch_latest_entries() -> list:
 
 
 def extract_image_from_entry(entry) -> str | None:
-    # 1) media_content / media_thumbnail (استاندارد اکثر فیدهای خبری گیم)
     if hasattr(entry, "media_content") and entry.media_content:
         url = entry.media_content[0].get("url")
         if url:
@@ -132,11 +148,9 @@ def extract_image_from_entry(entry) -> str | None:
         url = entry.media_thumbnail[0].get("url")
         if url:
             return url
-    # 2) enclosure
     for link in entry.get("links", []):
         if link.get("type", "").startswith("image"):
             return link.get("href")
-    # 3) عکس داخل خود summary/content
     html = entry.get("summary", "") + str(entry.get("content", ""))
     match = re.search(r'<img[^>]+src="([^"]+)"', html)
     if match:
@@ -145,7 +159,6 @@ def extract_image_from_entry(entry) -> str | None:
 
 
 def fetch_og_image(page_url: str) -> str | None:
-    """اگه فید عکس نداشت، از og:image خود صفحه‌ی خبر می‌گیریم."""
     try:
         resp = requests.get(page_url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
         soup = BeautifulSoup(resp.text, "html.parser")
@@ -205,18 +218,23 @@ def rewrite_with_gemini(item: dict) -> dict | None:
         response = model.generate_content(prompt)
         raw = response.text.strip()
         raw = re.sub(r"^```json|```$", "", raw, flags=re.MULTILINE).strip()
-        data = json.loads(raw)
-        return data
+        return json.loads(raw)
     except Exception as e:
         log.error("خطا در پردازش Gemini برای '%s': %s", item["title"], e)
         return None
+
+
+def build_caption(rewritten: dict) -> str:
+    caption = f"<b>{rewritten['title_fa']}</b>\n\n{rewritten['body_fa']}\n\n"
+    caption += " ".join(rewritten.get("hashtags", []))
+    return caption
 
 
 # ---------------------------------------------------------------------------
 # استیکر تصادفی
 # ---------------------------------------------------------------------------
 
-async def get_random_sticker_file_id() -> str | None:
+async def get_random_sticker_file_id(bot) -> str | None:
     if not STICKER_PACK_NAMES:
         return None
     pack_name = random.choice(STICKER_PACK_NAMES)
@@ -230,21 +248,81 @@ async def get_random_sticker_file_id() -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# ارسال به کانال
+# فرستادن پیش‌نویس به گروه تأیید
 # ---------------------------------------------------------------------------
 
-async def send_news_to_channel(item: dict, rewritten: dict) -> None:
-    caption = f"<b>{rewritten['title_fa']}</b>\n\n{rewritten['body_fa']}\n\n"
-    caption += " ".join(rewritten.get("hashtags", []))
-    # ایموجی‌ها رو خود Gemini داخل متن قرار می‌ده؛ اینجا چیزی اضافه نمی‌کنیم
-
+async def send_draft(bot, item: dict, rewritten: dict) -> None:
+    caption = build_caption(rewritten)
     image_url = item.get("image") or fetch_og_image(item["link"])
+    footer = "\n\n———\n🗂 برای انتشار در کانال، رو همین پیام ریپلای کن و بنویس: /post"
 
     if DRY_RUN:
-        log.info("—— DRY RUN ——\n%s\nعکس: %s\n", caption, image_url)
+        log.info("—— DRY RUN (پیش‌نویس) ——\n%s%s\nعکس: %s\n", caption, footer, image_url)
         return
 
-    sticker_id = await get_random_sticker_file_id()
+    try:
+        if image_url:
+            msg = await bot.send_photo(
+                chat_id=DRAFT_GROUP_ID,
+                photo=image_url,
+                caption=caption + footer,
+                parse_mode="HTML",
+            )
+        else:
+            msg = await bot.send_message(
+                chat_id=DRAFT_GROUP_ID, text=caption + footer, parse_mode="HTML"
+            )
+    except TelegramError as e:
+        log.error("ارسال پیش‌نویس به گروه ناموفق بود: %s", e)
+        return
+
+    drafts = load_pending_drafts()
+    drafts[str(msg.message_id)] = {
+        "title_fa": rewritten["title_fa"],
+        "body_fa": rewritten["body_fa"],
+        "hashtags": rewritten.get("hashtags", []),
+        "image_url": image_url,
+        "source_link": item["link"],
+    }
+    save_pending_drafts(drafts)
+    log.info("پیش‌نویس فرستاده شد و منتظر تأیید (/post) هست: %s", rewritten["title_fa"])
+
+
+# ---------------------------------------------------------------------------
+# دستور /post — انتشار پیش‌نویس تأییدشده به کانال
+# ---------------------------------------------------------------------------
+
+async def handle_post_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    if message is None or str(message.chat_id) != str(DRAFT_GROUP_ID):
+        return  # فقط تو گروه پیش‌نویس فعاله
+
+    if message.reply_to_message is None:
+        await message.reply_text("باید روی خودِ پیام پیش‌نویس ریپلای کنی و /post بزنی.")
+        return
+
+    if ALLOWED_APPROVER_IDS and message.from_user.id not in ALLOWED_APPROVER_IDS:
+        await message.reply_text("متأسفم، اجازه‌ی تأیید و انتشار خبر رو نداری.")
+        return
+
+    draft_id = str(message.reply_to_message.message_id)
+    drafts = load_pending_drafts()
+    draft = drafts.get(draft_id)
+
+    if draft is None:
+        await message.reply_text("این پیش‌نویس پیدا نشد (شاید قبلاً منتشر شده یا منقضی شده).")
+        return
+
+    rewritten = {
+        "title_fa": draft["title_fa"],
+        "body_fa": draft["body_fa"],
+        "hashtags": draft["hashtags"],
+    }
+    caption = build_caption(rewritten)
+    image_url = draft.get("image_url")
+    bot = context.bot
+
+    sticker_id = await get_random_sticker_file_id(bot)
     if sticker_id:
         try:
             await bot.send_sticker(chat_id=CHANNEL_ID, sticker=sticker_id)
@@ -254,23 +332,26 @@ async def send_news_to_channel(item: dict, rewritten: dict) -> None:
     try:
         if image_url:
             await bot.send_photo(
-                chat_id=CHANNEL_ID,
-                photo=image_url,
-                caption=caption,
-                parse_mode="HTML",
+                chat_id=CHANNEL_ID, photo=image_url, caption=caption, parse_mode="HTML"
             )
         else:
             await bot.send_message(chat_id=CHANNEL_ID, text=caption, parse_mode="HTML")
-        log.info("ارسال شد: %s", rewritten["title_fa"])
     except TelegramError as e:
         log.error("ارسال خبر به کانال ناموفق بود: %s", e)
+        await message.reply_text(f"❌ ارسال به کانال ناموفق بود: {e}")
+        return
+
+    del drafts[draft_id]
+    save_pending_drafts(drafts)
+    await message.reply_text("✅ منتشر شد تو کانال.")
+    log.info("خبر با تأیید کاربر منتشر شد: %s", draft["title_fa"])
 
 
 # ---------------------------------------------------------------------------
-# حلقه‌ی اصلی
+# چک دوره‌ای برای خبر جدید (job)
 # ---------------------------------------------------------------------------
 
-async def run_once() -> None:
+async def check_for_news(context: ContextTypes.DEFAULT_TYPE) -> None:
     sent_links = load_sent_links()
     entries = fetch_latest_entries()
 
@@ -284,27 +365,33 @@ async def run_once() -> None:
     for item in new_entries:
         log.info("در حال بررسی: [%s] %s", item["source"], item["title"])
         rewritten = rewrite_with_gemini(item)
-        sent_links.add(item["link"])  # چه منتشر بشه چه نشه، دیگه دوباره چک نمی‌شه
+        sent_links.add(item["link"])  # چه پیش‌نویس بشه چه رد بشه، دوباره چک نمی‌شه
 
         if not rewritten or not rewritten.get("is_worth_posting"):
             log.info("رد شد (کم‌ارزش یا خطا): %s", item["title"])
             continue
 
-        await send_news_to_channel(item, rewritten)
-        await asyncio.sleep(3)  # فاصله‌ی کوچیک بین پیام‌ها
+        await send_draft(context.bot, item, rewritten)
 
     save_sent_links(sent_links)
 
 
-async def main_loop() -> None:
-    log.info("ربات اخبار گیم شروع به کار کرد. هر %s دقیقه چک می‌کنه.", CHECK_INTERVAL_MINUTES)
-    while True:
-        try:
-            await run_once()
-        except Exception as e:
-            log.exception("خطای غیرمنتظره در حلقه‌ی اصلی: %s", e)
-        await asyncio.sleep(CHECK_INTERVAL_MINUTES * 60)
+# ---------------------------------------------------------------------------
+# راه‌اندازی برنامه
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("post", handle_post_command))
+    app.job_queue.run_repeating(
+        check_for_news, interval=CHECK_INTERVAL_MINUTES * 60, first=5
+    )
+    log.info(
+        "ربات اخبار گیم شروع به کار کرد. هر %s دقیقه چک می‌کنه و پیش‌نویس‌ها منتظر /post می‌مونن.",
+        CHECK_INTERVAL_MINUTES,
+    )
+    app.run_polling()
 
 
 if __name__ == "__main__":
-    asyncio.run(main_loop())
+    main()
