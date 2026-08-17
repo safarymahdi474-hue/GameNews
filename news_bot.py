@@ -1,716 +1,310 @@
 """
-ربات اخبار گیم فارسی برای تلگرام
-----------------------------------
-این اسکریپت جدیدترین اخبار دنیای گیم رو از چند منبع معتبر می‌گیره،
-با گوگل ترنسلیت به فارسی برمی‌گردونه و همراه با عکس (اگه موجود باشه)
-به یه کانال تلگرام می‌فرسته.
+ربات اخبار گیم فارسی برای تلگرام — نسخه‌ی خودکار با Gemini
+------------------------------------------------------------
+این نسخه به‌طور کامل خودکار عمل می‌کنه:
+1) از فیدهای RSS سایت‌های خبری گیم (IGN, GameSpot, Eurogamer, PC Gamer)
+   جدیدترین خبرها رو می‌گیره (اخبار انیمه دیگه پیگیری نمی‌شه).
+2) هر خبر رو به Gemini می‌ده تا:
+   - تشخیص بده خبر ارزش انتشار داره یا نه (تخفیف/لیست/ریویو صرف = رد بشه)
+   - عنوان و متن رو به فارسیِ روان، جذاب و با لحن خبری-هیجانی بازنویسی کنه
+   - چند هشتگ مرتبط فارسی/انگلیسی پیشنهاد بده
+3) عکس خبر رو (از خود فید یا og:image صفحه) پیدا می‌کنه.
+4) یک استیکر گیمینگ تصادفی (از پک‌های تنظیم‌شده) + عکس خبر + کپشن جذاب رو
+   مستقیم به کانال تنظیم‌شده می‌فرسته.
+5) برای جلوگیری از تکرار، لینک خبرهای فرستاده‌شده رو تو sent_news.json نگه می‌داره.
 
-قبل از اجرا حتماً بخش تنظیمات (CONFIG) رو کامل کنید.
+نکته: این نسخه دیگه نیازی به «گروه پیش‌نویس» و دستور /post نداره؛ همه‌چیز خودکاره.
+اگه هنوز می‌خوای قبل از انتشار خبرها رو تأیید کنی، می‌تونی DRY_RUN=1 بذاری تا
+فقط تو ترمینال چاپ بشن و به کانال ارسال نشن.
 """
 
 import os
-import re
-import html
 import json
-import time
+import random
+import asyncio
 import logging
-import threading
+import re
+from datetime import datetime, timezone
 
 import feedparser
 import requests
-from deep_translator import GoogleTranslator
+from bs4 import BeautifulSoup
+import google.generativeai as genai
+from telegram import Bot
+from telegram.error import TelegramError
 
-# ============================================================
-# تنظیمات (این‌ها رو با اطلاعات خودتون پر کنید)
-# ============================================================
+# ---------------------------------------------------------------------------
+# تنظیمات
+# ---------------------------------------------------------------------------
 
-# توکن ربات تلگرام - از @BotFather بگیرید
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "REPLACE_WITH_YOUR_BOT_TOKEN")
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+CHANNEL_ID = os.environ["CHANNEL_ID"]                       # مثل @yourchannel یا -100...
+GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
-# کلید API آنتروپیک برای ترجمه با کیفیت بالا (اختیاری - نیاز به شارژ داره)
-# از https://console.anthropic.com بگیرید. اگه خالی باشه از Gemini یا گوگل ترنسلیت استفاده می‌شه.
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-
-# مدلی که برای ترجمه با Claude استفاده می‌شه
-TRANSLATION_MODEL = os.environ.get("TRANSLATION_MODEL", "claude-haiku-4-5-20251001")
-
-# کلید API رایگان گوگل جمینای برای ترجمه با کیفیت بالا و بدون هزینه
-# از https://aistudio.google.com/apikey بگیرید (نیاز به کارت بانکی نداره)
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")
-
-# آیدی یا یوزرنیم کانال نهایی که با دستور /post خبر تاییدشده توش منتشر می‌شه
-# اگه کانال پابلیکه: "@yourchannel"
-# اگه پرایوته: عددی شبیه "-1001234567890" (ربات باید ادمین کانال باشه)
-CHANNEL_ID = os.environ.get("CHANNEL_ID", "@your_channel_username")
-
-# آیدی گروهی که اخبار خام/پیش‌نویس اول توش پست می‌شن تا بررسی و تایید بشن
-# ربات باید عضو این گروه باشه (لازم نیست ادمین باشه، فقط باید بتونه پیام بفرسته و بخونه)
-# برای پیدا کردن آیدی گروه: یه پیام تو گروه بفرستید و با @JsonDumpBot یا مشابه chat.id رو پیدا کنید
-DRAFT_GROUP_ID = os.environ.get("DRAFT_GROUP_ID", "REPLACE_WITH_YOUR_GROUP_ID")
-
-# دستوری که با ریپلای‌کردن روی خبر و زدنش، اون خبر رو به کانال نهایی می‌فرسته
-REPOST_COMMAND = os.environ.get("REPOST_COMMAND", "/post")
-
-# خطی که به‌جای خط «منبع خبر» جایگزین می‌شه و داخل نقل‌قول قرار می‌گیره
-ATTRIBUTION_LINE = os.environ.get("ATTRIBUTION_LINE", "𝐈𝐃 : @HiromiyaStudio")
-
-# نکته: دستور /post برای همه‌ی اعضای گروه پیش‌نویس (DRAFT_GROUP_ID) فعاله؛
-# محدودیتی بر اساس آیدی کاربر وجود نداره، فقط باید داخل همون گروه زده بشه.
-
-# منابع خبری RSS (می‌تونید فید بیشتری اضافه یا کم کنید)
-# هر فید یک دسته (category) و ایموجی مخصوص خودش داره که تو پیام تلگرام نمایش داده می‌شه
-RSS_FEEDS = [
-    # --- اخبار گیم ---
-    {"url": "https://feeds.ign.com/ign/games-all", "emoji": "🎮", "label": "گیم"},
-    {"url": "https://www.gamespot.com/feeds/game-news/", "emoji": "🎮", "label": "گیم"},
-    {"url": "https://www.eurogamer.net/feed", "emoji": "🎮", "label": "گیم"},
-    {"url": "https://www.pcgamer.com/rss/", "emoji": "🎮", "label": "گیم"},
-    # --- اخبار انیمه ---
-    {"url": "https://www.animenewsnetwork.com/all/rss.xml?ann-edition=us", "emoji": "🎌", "label": "انیمه"},
-    {"url": "https://otakumode.com/news/feed", "emoji": "🎌", "label": "انیمه"},
+# اسم کوتاه پک‌های استیکر گیمینگ (بخش بعد از t.me/addstickers/ ) — با کاما جدا کن
+STICKER_PACK_NAMES = [
+    s.strip() for s in os.environ.get("STICKER_PACK_NAMES", "").split(",") if s.strip()
 ]
 
-# هر چند ثانیه یک‌بار فیدها رو چک کنه
-# نکته: چون هر چرخه حداکثر یک درخواست به AI می‌زنه، اگه با خطای ۴۲۹ (quota) مواجه شدید
-# این عدد رو بزرگ‌تر کنید (مثلاً ۳۶۰۰ برای هر ساعت) یا کمی صبر کنید تا سهمیه‌تون ریست بشه.
-CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL_SECONDS", "1800"))  # هر ۳۰ دقیقه
+# هر چند دقیقه یک‌بار چک کنه (پیش‌فرض ۱۵ دقیقه)
+CHECK_INTERVAL_MINUTES = int(os.environ.get("CHECK_INTERVAL_MINUTES", "15"))
 
-# حداکثر تعداد خبر جدید از هر فید در هر بار چک کردن
-MAX_ITEMS_PER_FEED = 8
+# حداکثر چند خبر تو هر دور بررسی بشه (برای رعایت محدودیت رایگان Gemini)
+MAX_ITEMS_PER_RUN = int(os.environ.get("MAX_ITEMS_PER_RUN", "5"))
 
-# فایلی که لینک خبرهای ارسال‌شده رو نگه می‌داره تا تکراری ارسال نشه
-SENT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sent_news.json")
+# اگه ۱ باشه، به‌جای ارسال واقعی فقط تو کنسول چاپ می‌کنه (تست بدون ریسک)
+DRY_RUN = os.environ.get("DRY_RUN", "0") == "1"
 
-# ============================================================
+SENT_NEWS_FILE = "sent_news.json"
+
+RSS_FEEDS = {
+    "IGN": "https://feeds.ign.com/ign/games-all",
+    "GameSpot": "https://www.gamespot.com/feeds/game-news/",
+    "Eurogamer": "https://www.eurogamer.net/feed",
+    "PC Gamer": "https://www.pcgamer.com/rss/",
+}
+
+GEMINI_MODEL_NAME = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
-log = logging.getLogger("gamenews_bot")
+log = logging.getLogger("gamenews-bot")
 
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel(GEMINI_MODEL_NAME)
 
-def load_sent_links():
-    if os.path.exists(SENT_FILE):
+bot = Bot(token=BOT_TOKEN)
+
+# ---------------------------------------------------------------------------
+# ذخیره‌سازی لینک‌های ارسال‌شده
+# ---------------------------------------------------------------------------
+
+def load_sent_links() -> set:
+    if os.path.exists(SENT_NEWS_FILE):
         try:
-            with open(SENT_FILE, "r", encoding="utf-8") as f:
+            with open(SENT_NEWS_FILE, "r", encoding="utf-8") as f:
                 return set(json.load(f))
-        except Exception:
-            return set()
+        except (json.JSONDecodeError, OSError):
+            log.warning("فایل sent_news.json خراب بود، از صفر شروع می‌کنیم.")
     return set()
 
 
-def save_sent_links(links_set):
-    # فقط ۵۰۰ تای آخر رو نگه می‌داریم تا فایل بی‌نهایت بزرگ نشه
-    trimmed = list(links_set)[-500:]
-    with open(SENT_FILE, "w", encoding="utf-8") as f:
-        json.dump(trimmed, f, ensure_ascii=False)
+def save_sent_links(links: set) -> None:
+    with open(SENT_NEWS_FILE, "w", encoding="utf-8") as f:
+        json.dump(sorted(links), f, ensure_ascii=False, indent=2)
 
 
-def clean_html(raw_html: str) -> str:
-    text = re.sub(r"<[^>]+>", " ", raw_html or "")
-    text = html.unescape(text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+# ---------------------------------------------------------------------------
+# گرفتن خبرهای جدید از فیدها
+# ---------------------------------------------------------------------------
 
-
-def fetch_page_description(url: str) -> str:
-    """
-    وقتی فید هیچ خلاصه‌ای نداشت، از تگ‌های meta description / og:description
-    خود صفحه‌ی خبر استفاده می‌کنیم (تقریباً همه‌ی سایت‌های خبری این تگ رو دارن).
-    """
-    try:
-        r = requests.get(
-            url,
-            timeout=15,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; GameNewsBot/1.0)"},
-        )
-        if r.status_code != 200:
-            return ""
-        page_html = r.text[:200000]  # فقط بخش ابتدایی صفحه کافیه (تگ‌های meta تو <head> هستن)
-
-        patterns = [
-            r'<meta[^>]+property=["\']og:description["\'][^>]+content=["\']([^"\']+)["\']',
-            r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:description["\']',
-            r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']+)["\']',
-            r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']description["\']',
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, page_html, re.IGNORECASE)
-            if match:
-                return html.unescape(match.group(1)).strip()
-    except Exception as e:
-        log.warning(f"خطا در گرفتن توضیحات از صفحه‌ی خبر: {e}")
-    return ""
-
-
-def extract_entry_summary(entry) -> str:
-    """
-    بعضی فیدها (مثل Anime News Network) به‌جای تگ استاندارد summary/description از
-    content:encoded یا تگ‌های دیگه استفاده می‌کنن. این تابع چند منبع رو امتحان می‌کنه.
-    """
-    # ۱. تگ استاندارد summary/description
-    for key in ("summary", "description"):
-        val = entry.get(key)
-        if val and clean_html(val):
-            return val
-
-    # ۲. content:encoded (feedparser این رو به‌صورت لیست تو entry.content می‌ذاره)
-    content_list = entry.get("content")
-    if content_list:
-        for c in content_list:
-            val = c.get("value", "")
-            if val and clean_html(val):
-                return val
-
-    # ۳. subtitle (بعضی فیدها از این استفاده می‌کنن)
-    val = entry.get("subtitle")
-    if val and clean_html(val):
-        return val
-
-    # ۴. tags/categories رو به‌عنوان آخرین راه‌حل به عنوان زمینه اضافه می‌کنیم (بهتر از هیچی)
-    return ""
-
-
-ANALYSIS_SYSTEM_PROMPT = (
-    "You are an editor for a Persian (Farsi) gaming and anime news Telegram channel. "
-    "You will receive a JSON array of news items, each with an \"index\", \"title\", and "
-    "\"summary\". For EACH item, do two things:\n"
-    "1. Decide if it is IMPORTANT enough to publish to a broad audience of gaming/anime fans.\n"
-    "   IMPORTANT: major game/anime announcements, confirmed release dates, trailers for "
-    "highly-anticipated titles, major updates/DLC/expansions, significant business news "
-    "(acquisitions, studio closures, major layoffs), award wins, major esports results, "
-    "platform-defining news.\n"
-    "   NOT IMPORTANT (reject): listicles/roundups ('10 best games...'), opinion/editorial "
-    "pieces, reviews, minor patch notes, sales/deals/discount promos, giveaways/contests, "
-    "unconfirmed rumors, how-to/guide articles, sponsored content, or anything with little "
-    "real news value.\n"
-    "2. If important, translate the title and summary into natural, fluent, journalistic "
-    "Persian that a native Persian gaming/anime fan would enjoy reading. Keep game/anime "
-    "titles, character names, and studio/company names in their commonly-used form among "
-    "Persian gaming/anime communities (often left in Latin script or transliterated, "
-    "whichever is more natural).\n\n"
-    "Respond with ONLY a raw JSON array, no markdown code fences, no extra text, with one "
-    "object per input item, each in exactly this shape and in the SAME ORDER as the input:\n"
-    '[{"index": 0, "important": true or false, "title_fa": "...", "summary_fa": "..."}, ...]\n'
-    "If important is false for an item, you may leave its title_fa and summary_fa as empty "
-    "strings. The output array MUST have exactly as many objects as the input array."
-)
-
-
-def _parse_analysis_array(raw_text: str, expected_len: int) -> list | None:
-    if not raw_text:
-        return None
-    cleaned = raw_text.strip()
-    # حذف فنس‌های مارک‌داون اگه مدل با ```json برگردونده باشه
-    cleaned = re.sub(r"^```(?:json)?", "", cleaned).strip()
-    cleaned = re.sub(r"```$", "", cleaned).strip()
-    try:
-        data = json.loads(cleaned)
-        if isinstance(data, list) and len(data) == expected_len:
-            return data
-    except Exception:
-        pass
-    return None
-
-
-def analyze_batch_with_gemini(items: list) -> list | None:
-    """با یک درخواست، همه‌ی خبرهای جدید رو با Gemini هم فیلتر و هم ترجمه می‌کنه (رایگان)."""
-    if not GEMINI_API_KEY or not items:
-        return None
-    try:
-        url = (
-            f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-        )
-        user_payload = [
-            {"index": i, "title": it["title"], "summary": it["summary"]}
-            for i, it in enumerate(items)
-        ]
-        payload = {
-            "systemInstruction": {"parts": [{"text": ANALYSIS_SYSTEM_PROMPT}]},
-            "contents": [{"parts": [{"text": json.dumps(user_payload, ensure_ascii=False)}]}],
-            "generationConfig": {"responseMimeType": "application/json"},
-        }
-        r = requests.post(url, json=payload, timeout=60)
-        data = r.json()
-        if r.status_code != 200:
-            log.warning(f"خطای Gemini API (کد {r.status_code}): {data}")
-            return None
-        candidates = data.get("candidates", [])
-        if not candidates:
-            return None
-        parts = candidates[0].get("content", {}).get("parts", [])
-        raw_text = "".join(p.get("text", "") for p in parts).strip()
-        return _parse_analysis_array(raw_text, len(items))
-    except Exception as e:
-        log.warning(f"خطا در تحلیل دسته‌ای با Gemini: {e}")
-        return None
-
-
-def analyze_batch_with_claude(items: list) -> list | None:
-    """با یک درخواست، همه‌ی خبرهای جدید رو با Claude هم فیلتر و هم ترجمه می‌کنه (نیاز به شارژ)."""
-    if not ANTHROPIC_API_KEY or not items:
-        return None
-    try:
-        user_payload = [
-            {"index": i, "title": it["title"], "summary": it["summary"]}
-            for i, it in enumerate(items)
-        ]
-        response = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": TRANSLATION_MODEL,
-                "max_tokens": 4000,
-                "system": ANALYSIS_SYSTEM_PROMPT,
-                "messages": [
-                    {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)}
-                ],
-            },
-            timeout=60,
-        )
-        data = response.json()
-        if response.status_code != 200:
-            log.warning(f"خطای Claude API (کد {response.status_code}): {data}")
-            return None
-        parts = data.get("content", [])
-        raw_text = "".join(
-            p.get("text", "") for p in parts if p.get("type") == "text"
-        ).strip()
-        return _parse_analysis_array(raw_text, len(items))
-    except Exception as e:
-        log.warning(f"خطا در تحلیل دسته‌ای با Claude: {e}")
-        return None
-
-
-# کلیدواژه‌هایی که در نبود هوش مصنوعی برای فیلتر کردن اخبار کم‌ارزش استفاده می‌شن
-LOW_VALUE_KEYWORDS = [
-    # --- تخفیف / فروش / پرومو ---
-    "deal", "deals", "% off", "discount", "coupon", "bundle sale",
-    "cheapest", "price drop", "on sale", "save $", "steam sale",
-    "amazon prime day", "black friday", "cyber monday", "sale ends",
-    "sale alert", "flash sale", "clearance", "free download",
-    "free this week", "epic games store free", "buy now",
-    "where to buy", "pre-order guide", "preorder guide",
-
-    # --- گیوآوی / مسابقه ---
-    "giveaway", "sweepstakes", "win a", "enter to win", "contest",
-    "raffle",
-
-    # --- لیست‌ها / رنکینگ ---
-    "top 10", "top ten", "top 5", "top five", "best of", "ranked",
-    "ranking", "every game", "everything you need to know",
-    "everything we know", "roundup", "recap", "definitive guide",
-    "ultimate guide", "complete list", "all the", "worth playing",
-    "games to play", "games you missed", "underrated games",
-
-    # --- ریویو / پیش‌نمایش / نظری ---
-    "review:", "our review", "hands-on", "hands on", "preview:",
-    "impressions", "we played", "opinion:", "editorial:", "op-ed",
-    "column:", "in defense of", "why i", "why you should",
-    "first look", "early access impressions", "our thoughts",
-    "is it worth", "should you buy", "should you play",
-
-    # --- آموزش / راهنما ---
-    "how to", "guide:", "tips and tricks", "walkthrough", "cheats",
-    "codes for", "redeem codes", "best settings", "best build",
-    "best loadout", "tier list", "best class", "beginner's guide",
-
-    # --- محتوای تعاملی/تبلیغاتی کم‌ارزش ---
-    "watch:", "video:", "livestream", "twitch stream", "let's play",
-    "unboxing", "reaction", "quiz:", "poll:", "which character are you",
-    "sponsored", "advertisement", "partner content", "in partnership with",
-    "promoted", "affiliate",
-
-    # --- زمان‌بندی/جزئیات فرعی (نه خبر اصلی) ---
-    "release time", "what time does", "how to watch", "how to stream",
-]
-
-
-def passes_keyword_filter(title: str, summary: str) -> bool:
-    combined = f"{title} {summary}".lower()
-    return not any(keyword in combined for keyword in LOW_VALUE_KEYWORDS)
-
-
-def analyze_and_translate_batch(items: list) -> list:
-    """
-    ورودی: [{"title": ..., "summary": ...}, ...]
-    خروجی: [{"important": bool, "title_fa": str, "summary_fa": str}, ...] هم‌طول و هم‌ترتیب با ورودی
-
-    اول با یک درخواست دسته‌ای به Gemini، بعد Claude امتحان می‌کنه. اگه هیچ‌کدوم
-    در دسترس نبودن یا جواب معتبر ندادن، برای هر خبر با فیلتر کلیدواژه‌ای ساده +
-    گوگل ترنسلیت پیش می‌ره.
-    """
-    if not items:
-        return []
-
-    raw_result = analyze_batch_with_gemini(items)
-    if raw_result is None:
-        raw_result = analyze_batch_with_claude(items)
-
-    if raw_result is not None:
-        results = []
-        for entry in raw_result:
-            results.append({
-                "important": bool(entry.get("important", False)),
-                "title_fa": entry.get("title_fa", "") or "",
-                "summary_fa": entry.get("summary_fa", "") or "",
-            })
-        return results
-
-    # --- حالت پشتیبان: بدون هوش مصنوعی، تک‌تک با فیلتر کلیدواژه‌ای + گوگل ترنسلیت ---
-    log.warning("هوش مصنوعی در دسترس نبود؛ از فیلتر کلیدواژه‌ای و گوگل ترنسلیت استفاده می‌شه.")
-    results = []
-    for it in items:
-        title, summary = it["title"], it["summary"]
-        important = passes_keyword_filter(title, summary)
-        if not important:
-            results.append({"important": False, "title_fa": "", "summary_fa": ""})
-            continue
+def fetch_latest_entries() -> list:
+    """جدیدترین خبر هر منبع رو برمی‌گردونه (چندتا آیتم از هر فید)."""
+    entries = []
+    for source_name, url in RSS_FEEDS.items():
         try:
-            title_fa = GoogleTranslator(source="auto", target="fa").translate(title)
-            summary_fa = GoogleTranslator(source="auto", target="fa").translate(summary[:4000])
+            parsed = feedparser.parse(url)
+            for entry in parsed.entries[:3]:  # ۳ خبر اول هر منبع کافیه
+                entries.append({
+                    "source": source_name,
+                    "title": entry.get("title", "").strip(),
+                    "link": entry.get("link", "").strip(),
+                    "summary": BeautifulSoup(
+                        entry.get("summary", entry.get("description", "")),
+                        "html.parser",
+                    ).get_text().strip(),
+                    "image": extract_image_from_entry(entry),
+                })
         except Exception as e:
-            log.warning(f"خطا در ترجمه: {e}")
-            title_fa, summary_fa = title, summary
-        results.append({"important": True, "title_fa": title_fa, "summary_fa": summary_fa})
-    return results
+            log.error("خطا در خوندن فید %s: %s", source_name, e)
+    return entries
 
 
-def extract_image_url(entry) -> str | None:
-    # media:content
-    media_content = entry.get("media_content")
-    if media_content:
-        for m in media_content:
-            if m.get("url"):
-                return m["url"]
-
-    # media:thumbnail
-    media_thumbnail = entry.get("media_thumbnail")
-    if media_thumbnail:
-        for m in media_thumbnail:
-            if m.get("url"):
-                return m["url"]
-
-    # enclosure links با نوع image
+def extract_image_from_entry(entry) -> str | None:
+    # 1) media_content / media_thumbnail (استاندارد اکثر فیدهای خبری گیم)
+    if hasattr(entry, "media_content") and entry.media_content:
+        url = entry.media_content[0].get("url")
+        if url:
+            return url
+    if hasattr(entry, "media_thumbnail") and entry.media_thumbnail:
+        url = entry.media_thumbnail[0].get("url")
+        if url:
+            return url
+    # 2) enclosure
     for link in entry.get("links", []):
-        if str(link.get("type", "")).startswith("image"):
+        if link.get("type", "").startswith("image"):
             return link.get("href")
-
-    # جستجوی تگ <img> داخل summary یا content
-    for field in ("summary", "content"):
-        value = entry.get(field)
-        if isinstance(value, list) and value:
-            value = value[0].get("value", "")
-        if value:
-            match = re.search(r'<img[^>]+src="([^"]+)"', value)
-            if match:
-                return match.group(1)
-
+    # 3) عکس داخل خود summary/content
+    html = entry.get("summary", "") + str(entry.get("content", ""))
+    match = re.search(r'<img[^>]+src="([^"]+)"', html)
+    if match:
+        return match.group(1)
     return None
 
 
-def send_photo(chat_id: str, photo_source: str, caption: str) -> bool:
-    """photo_source می‌تونه یه URL باشه یا یه file_id تلگرامی (برای ریپست عکس‌های موجود)."""
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
-    payload = {
-        "chat_id": chat_id,
-        "photo": photo_source,
-        "caption": caption,
-        "parse_mode": "HTML",
-    }
+def fetch_og_image(page_url: str) -> str | None:
+    """اگه فید عکس نداشت، از og:image خود صفحه‌ی خبر می‌گیریم."""
     try:
-        r = requests.post(url, data=payload, timeout=20)
-        result = r.json()
-        if result.get("ok"):
-            return True
-        log.warning(f"ارسال عکس ناموفق بود: {result}")
-        return False
+        resp = requests.get(page_url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        soup = BeautifulSoup(resp.text, "html.parser")
+        tag = soup.find("meta", property="og:image")
+        if tag and tag.get("content"):
+            return tag["content"]
     except Exception as e:
-        log.warning(f"خطا در ارسال عکس: {e}")
-        return False
+        log.warning("نشد og:image رو از %s بگیریم: %s", page_url, e)
+    return None
 
 
-def send_text(chat_id: str, caption: str) -> bool:
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": caption,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": False,
-    }
-    try:
-        r = requests.post(url, data=payload, timeout=20)
-        result = r.json()
-        if result.get("ok"):
-            return True
-        log.warning(f"ارسال متن ناموفق بود: {result}")
-        return False
-    except Exception as e:
-        log.warning(f"خطا در ارسال متن: {e}")
-        return False
+# ---------------------------------------------------------------------------
+# بازنویسی جذاب با Gemini
+# ---------------------------------------------------------------------------
+
+GEMINI_PROMPT = """
+تو یک ادمین حرفه‌ای و باتجربه‌ی یک کانال خبری گیمینگ فارسی هستی که مخاطب‌های
+جوان و پرشور داره. یک خبر گیمینگ به زبان انگلیسی بهت می‌دم. باید:
+
+1. تشخیص بدی این خبر ارزش انتشار داره یا نه. خبرهایی مثل «تخفیف فروشگاه»،
+   «لیست بهترین بازی‌ها»، «ریویوی یک بازی قدیمی»، «راهنمای گیم‌پلی» ارزش کم دارن
+   و نباید منتشر بشن. خبر مهم یعنی: معرفی/رونمایی بازی جدید، آپدیت بزرگ،
+   تاریخ انتشار، تریلر جدید، اتفاق مهم صنعت گیم، اخبار شرکت‌های بزرگ گیم.
+
+2. اگه ارزش انتشار داره، عنوان و متن رو کاملاً به فارسیِ روان، خودمونی ولی حرفه‌ای
+   و به‌شدت جذاب بازنویسی کن — نه ترجمه‌ی کلمه‌به‌کلمه. از لحن هیجان‌انگیز و
+   ریتم خبری استفاده کن. تو عنوان و لابه‌لای متن از **ایموجی‌های معمولیِ کیبورد**
+   (مثل 🎮🔥🚀💥🕹️⚡️🆕👀💣🏆) به‌شکل شیک و طبیعی استفاده کن تا خوندنش نشاط
+   داشته باشه — ولی زیاده‌روی نکن (در کل متن حداکثر ۴-۶ ایموجی، نه بیشتر، و
+   هیچ‌وقت ایموجی پشت‌سرهم توی یک جا).
+
+3. متن نهایی باید ۳ تا ۵ جمله‌ی کوتاه، خوش‌ریتم و خوش‌خوان باشه، نه یک پاراگراف
+   طولانی و خسته‌کننده. هر جمله باید حس هیجان و تازگیِ خبر رو منتقل کنه، انگار
+   داری برای یه دوست گیمر تعریف می‌کنی، نه این‌که داری گزارش رسمی می‌نویسی.
+
+4. سه تا پنج هشتگ مرتبط فارسی/انگلیسی هم پیشنهاد بده (مثل #گیم #PS5 #بازی_جدید).
+
+فقط و فقط یک JSON خام با این ساختار برگردون، بدون توضیح اضافه و بدون ```:
+{{
+  "is_worth_posting": true/false,
+  "title_fa": "عنوان جذاب فارسی",
+  "body_fa": "متن جذاب فارسی",
+  "hashtags": ["#تگ۱", "#تگ۲"]
+}}
+
+عنوان خبر: {title}
+متن خبر: {summary}
+منبع: {source}
+"""
 
 
-# الگویی برای پیدا کردن بخش‌های لاتین/عددی داخل متن فارسی (اسم بازی، تاریخ، عدد و ...)
-LATIN_RUN_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9 .,'\-:/&+()]*[A-Za-z0-9]|[A-Za-z0-9]")
-
-
-def fix_persian_rtl(text: str) -> str:
-    """
-    شبیه اکستنشن‌های راست‌چین‌کننده‌ی فارسی: با اضافه‌کردن نشانه‌های نامرئی جهت‌دهی
-    یونیکد، مطمئن می‌شه متنی که کلمات/اعداد لاتین (اسم بازی، تاریخ و...) وسطش
-    هست، درست و راست‌به‌چپ نمایش داده بشه و ترتیب کلمات به‌هم نریزه.
-    """
-    if not text:
-        return text
-
-    def wrap(match):
-        # هر بخش لاتین/عددی رو با ایزوله‌ی جهت چپ‌به‌راست (LRI...PDI) احاطه می‌کنیم
-        # تا الگوریتم bidi تلگرام نظمش رو با متن فارسی اطراف به‌هم نریزه
-        return "\u2066" + match.group(0) + "\u2069"
-
-    text = LATIN_RUN_PATTERN.sub(wrap, text)
-    # علامت راست‌به‌چپ (RLM) در ابتدای متن، تا جهت کلی پاراگراف قطعاً راست‌به‌چپ باشه
-    # (مخصوصاً وقتی خط با ایموجی یا کلمه‌ی لاتین شروع می‌شه)
-    return "\u200f" + text
-
-
-def build_caption(title_fa: str, summary_fa: str, link: str, emoji: str = "🎮") -> str:
-    title_fa = fix_persian_rtl(title_fa)
-    summary_fa = fix_persian_rtl(summary_fa)
-    caption = f"{emoji} <b>{html.escape(title_fa)}</b>\n\n{html.escape(summary_fa)}\n\n🔗 <a href=\"{link}\">منبع خبر</a>"
-    # تلگرام کپشن عکس رو حداکثر ۱۰۲۴ کاراکتر قبول می‌کنه
-    if len(caption) > 1000:
-        allowed_summary_len = 1000 - len(title_fa) - len(link) - 60
-        short_summary = summary_fa[: max(allowed_summary_len, 0)] + "…"
-        caption = f"{emoji} <b>{html.escape(title_fa)}</b>\n\n{html.escape(short_summary)}\n\n🔗 <a href=\"{link}\">منبع خبر</a>"
-    return caption
-
-
-def process_feeds():
-    sent_links = load_sent_links()
-    new_items_found = 0
-    skipped_low_value = 0
-
-    # مرحله ۱: جمع‌آوری تمام خبرهای جدید از همه‌ی فیدها
-    candidates = []  # هر آیتم: {"entry":..., "link":..., "title":..., "summary":..., "emoji":..., "label":...}
-    for feed_info in RSS_FEEDS:
-        feed_url = feed_info["url"]
-        emoji = feed_info.get("emoji", "🎮")
-        label = feed_info.get("label", "خبر")
-
-        log.info(f"در حال بررسی فید {label}: {feed_url}")
-        try:
-            feed = feedparser.parse(feed_url)
-        except Exception as e:
-            log.warning(f"خطا در خواندن فید {feed_url}: {e}")
-            continue
-
-        for entry in feed.entries[:MAX_ITEMS_PER_FEED]:
-            link = entry.get("link")
-            if not link or link in sent_links:
-                continue
-
-            title = entry.get("title", "").strip()
-            raw_summary = extract_entry_summary(entry)
-            summary = clean_html(raw_summary)[:600]
-
-            if not summary:
-                # اگه فید هیچ خلاصه‌ای نداشت، از خود صفحه‌ی خبر بگیر
-                summary = clean_html(fetch_page_description(link))[:600]
-
-            candidates.append({
-                "entry": entry,
-                "link": link,
-                "title": title,
-                "summary": summary,
-                "emoji": emoji,
-                "label": label,
-            })
-
-    if not candidates:
-        log.info("خبر جدیدی برای بررسی پیدا نشد.")
-        return
-
-    # مرحله ۲: تحلیل و ترجمه‌ی دسته‌ای همه‌ی کاندیدها با یک درخواست
-    log.info(f"در حال تحلیل {len(candidates)} خبر جدید...")
-    analyses = analyze_and_translate_batch(
-        [{"title": c["title"], "summary": c["summary"]} for c in candidates]
+def rewrite_with_gemini(item: dict) -> dict | None:
+    prompt = GEMINI_PROMPT.format(
+        title=item["title"], summary=item["summary"][:1500], source=item["source"]
     )
+    try:
+        response = model.generate_content(prompt)
+        raw = response.text.strip()
+        raw = re.sub(r"^```json|```$", "", raw, flags=re.MULTILINE).strip()
+        data = json.loads(raw)
+        return data
+    except Exception as e:
+        log.error("خطا در پردازش Gemini برای '%s': %s", item["title"], e)
+        return None
 
-    # مرحله ۳: ارسال خبرهای مهم به تلگرام
-    for candidate, analysis in zip(candidates, analyses):
-        link = candidate["link"]
-        title = candidate["title"]
 
-        if not analysis["important"]:
-            log.info(f"رد شد (کم‌ارزش): {title}")
-            sent_links.add(link)  # دیگه دوباره بررسیش نکنه
-            skipped_low_value += 1
+# ---------------------------------------------------------------------------
+# استیکر تصادفی
+# ---------------------------------------------------------------------------
+
+async def get_random_sticker_file_id() -> str | None:
+    if not STICKER_PACK_NAMES:
+        return None
+    pack_name = random.choice(STICKER_PACK_NAMES)
+    try:
+        sticker_set = await bot.get_sticker_set(pack_name)
+        if sticker_set.stickers:
+            return random.choice(sticker_set.stickers).file_id
+    except TelegramError as e:
+        log.warning("نشد پک استیکر '%s' رو بگیریم: %s", pack_name, e)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# ارسال به کانال
+# ---------------------------------------------------------------------------
+
+async def send_news_to_channel(item: dict, rewritten: dict) -> None:
+    caption = f"<b>{rewritten['title_fa']}</b>\n\n{rewritten['body_fa']}\n\n"
+    caption += " ".join(rewritten.get("hashtags", []))
+    # ایموجی‌ها رو خود Gemini داخل متن قرار می‌ده؛ اینجا چیزی اضافه نمی‌کنیم
+
+    image_url = item.get("image") or fetch_og_image(item["link"])
+
+    if DRY_RUN:
+        log.info("—— DRY RUN ——\n%s\nعکس: %s\n", caption, image_url)
+        return
+
+    sticker_id = await get_random_sticker_file_id()
+    if sticker_id:
+        try:
+            await bot.send_sticker(chat_id=CHANNEL_ID, sticker=sticker_id)
+        except TelegramError as e:
+            log.warning("ارسال استیکر ناموفق بود: %s", e)
+
+    try:
+        if image_url:
+            await bot.send_photo(
+                chat_id=CHANNEL_ID,
+                photo=image_url,
+                caption=caption,
+                parse_mode="HTML",
+            )
+        else:
+            await bot.send_message(chat_id=CHANNEL_ID, text=caption, parse_mode="HTML")
+        log.info("ارسال شد: %s", rewritten["title_fa"])
+    except TelegramError as e:
+        log.error("ارسال خبر به کانال ناموفق بود: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# حلقه‌ی اصلی
+# ---------------------------------------------------------------------------
+
+async def run_once() -> None:
+    sent_links = load_sent_links()
+    entries = fetch_latest_entries()
+
+    new_entries = [e for e in entries if e["link"] and e["link"] not in sent_links]
+    new_entries = new_entries[:MAX_ITEMS_PER_RUN]
+
+    if not new_entries:
+        log.info("خبر جدیدی نبود.")
+        return
+
+    for item in new_entries:
+        log.info("در حال بررسی: [%s] %s", item["source"], item["title"])
+        rewritten = rewrite_with_gemini(item)
+        sent_links.add(item["link"])  # چه منتشر بشه چه نشه، دیگه دوباره چک نمی‌شه
+
+        if not rewritten or not rewritten.get("is_worth_posting"):
+            log.info("رد شد (کم‌ارزش یا خطا): %s", item["title"])
             continue
 
-        title_fa = analysis["title_fa"] or title
-        summary_fa = analysis["summary_fa"] or candidate["summary"]
-        image_url = extract_image_url(candidate["entry"])
+        await send_news_to_channel(item, rewritten)
+        await asyncio.sleep(3)  # فاصله‌ی کوچیک بین پیام‌ها
 
-        caption = build_caption(title_fa, summary_fa, link, candidate["emoji"])
-
-        log.info(f"در حال ارسال خبر ({candidate['label']}): {title}")
-
-        sent_ok = False
-        if image_url:
-            sent_ok = send_photo(DRAFT_GROUP_ID, image_url, caption)
-            if not sent_ok:
-                # اگه عکس مشکل داشت، به‌صورت متنی بفرست
-                sent_ok = send_text(DRAFT_GROUP_ID, caption)
-        else:
-            sent_ok = send_text(DRAFT_GROUP_ID, caption)
-
-        if sent_ok:
-            sent_links.add(link)
-            new_items_found += 1
-            # کمی مکث بین پیام‌ها تا به محدودیت تلگرام نخوریم
-            time.sleep(3)
-
-    if new_items_found or skipped_low_value:
-        save_sent_links(sent_links)
-        log.info(
-            f"مجموعاً {new_items_found} خبر مهم ارسال شد، "
-            f"{skipped_low_value} خبر کم‌ارزش رد شد."
-        )
-    else:
-        log.info("خبر جدیدی برای ارسال پیدا نشد.")
+    save_sent_links(sent_links)
 
 
-def get_updates(offset: int | None = None, timeout: int = 25) -> list:
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
-    params = {"timeout": timeout, "allowed_updates": json.dumps(["message"])}
-    if offset is not None:
-        params["offset"] = offset
-    try:
-        r = requests.get(url, params=params, timeout=timeout + 10)
-        data = r.json()
-        if not data.get("ok"):
-            log.warning(f"خطا در getUpdates: {data}")
-            return []
-        return data.get("result", [])
-    except Exception as e:
-        log.warning(f"خطا در دریافت آپدیت‌ها: {e}")
-        return []
-
-
-def build_repost_caption(original_text: str) -> str:
-    """
-    خط آخر (منبع خبر) رو از متن اصلی حذف می‌کنه و به‌جاش خط ATTRIBUTION_LINE رو
-    به‌صورت نقل‌قول (blockquote) اضافه می‌کنه. توجه: تلگرام فرمت (بولد و ...) رو
-    به‌صورت entities جدا نگه می‌داره نه تو خود متن، پس متنی که این تابع می‌گیره
-    خامه و فرمت اصلی (بولد عنوان) حفظ نمی‌شه؛ ولی محتوا و ساختار خطوط دست‌نخورده‌ست.
-    """
-    lines = (original_text or "").split("\n")
-    # از آخر خط‌های خالی و خط منبع خبر رو حذف کن
-    while lines and (
-        lines[-1].strip() == ""
-        or "منبع خبر" in lines[-1]
-        or lines[-1].strip().startswith("🔗")
-    ):
-        lines.pop()
-    content = "\n".join(lines).rstrip()
-    new_caption = f"{html.escape(content)}\n\n<blockquote>{html.escape(ATTRIBUTION_LINE)}</blockquote>"
-    return new_caption
-
-
-def handle_repost_command(message: dict) -> None:
-    chat_id = message["chat"]["id"]
-
-    # فقط داخل خود گروه پیش‌نویس این دستور کار کنه (نه تو چت خصوصی یا جای دیگه)
-    if str(chat_id) != str(DRAFT_GROUP_ID):
-        return
-
-    sender = message.get("from", {}) or {}
-    sender_name = sender.get("username") or sender.get("first_name") or str(sender.get("id"))
-
-    reply_to = message.get("reply_to_message")
-    if not reply_to:
-        send_text(
-            chat_id,
-            f"برای استفاده از {html.escape(REPOST_COMMAND)} باید روی پیام خبر مورد نظر ریپلای کنید.",
-        )
-        return
-
-    original_text = reply_to.get("caption") or reply_to.get("text") or ""
-    new_caption = build_repost_caption(original_text)
-
-    photos = reply_to.get("photo")
-    sent_ok = False
-    if photos:
-        file_id = photos[-1]["file_id"]  # بزرگ‌ترین سایز عکس، آخرین آیتم لیسته
-        sent_ok = send_photo(CHANNEL_ID, file_id, new_caption)
-    else:
-        sent_ok = send_text(CHANNEL_ID, new_caption)
-
-    if sent_ok:
-        log.info(f"خبر با دستور {sender_name} به کانال ارسال شد.")
-        send_text(chat_id, "✅ خبر با موفقیت به کانال ارسال شد.")
-    else:
-        send_text(chat_id, "❌ ارسال خبر به کانال با خطا مواجه شد.")
-
-
-def handle_update(update: dict) -> None:
-    message = update.get("message")
-    if not message:
-        return
-    text = (message.get("text") or "").strip()
-    if text != REPOST_COMMAND:
-        return
-    try:
-        handle_repost_command(message)
-    except Exception as e:
-        log.warning(f"خطا در پردازش دستور ریپست: {e}")
-
-
-def command_listener_loop() -> None:
-    """تو یه ترد جدا به‌صورت مداوم به دستورهای ریپلای/کامند تلگرام گوش می‌ده."""
-    log.info(f"گوش‌دادن به دستور {REPOST_COMMAND} شروع شد...")
-
-    # اول بک‌لاگ آپدیت‌های قدیمی رو رد می‌کنیم تا بعد از هر ری‌استارت، دستورهای قدیمی اجرا نشن
-    offset = None
-    backlog = get_updates(offset=None, timeout=1)
-    if backlog:
-        offset = backlog[-1]["update_id"] + 1
-
-    while True:
-        updates = get_updates(offset=offset, timeout=25)
-        for update in updates:
-            offset = update["update_id"] + 1
-            handle_update(update)
-
-
-def main():
-    if BOT_TOKEN.startswith("REPLACE_WITH"):
-        log.error("لطفاً ابتدا BOT_TOKEN و CHANNEL_ID رو در تنظیمات وارد کنید.")
-        return
-    if DRAFT_GROUP_ID.startswith("REPLACE_WITH"):
-        log.error("لطفاً ابتدا DRAFT_GROUP_ID رو در تنظیمات وارد کنید (آیدی گروه پیش‌نویس).")
-        return
-
-    log.info("ربات اخبار گیم شروع به کار کرد...")
-
-    listener_thread = threading.Thread(target=command_listener_loop, daemon=True)
-    listener_thread.start()
-
+async def main_loop() -> None:
+    log.info("ربات اخبار گیم شروع به کار کرد. هر %s دقیقه چک می‌کنه.", CHECK_INTERVAL_MINUTES)
     while True:
         try:
-            process_feeds()
+            await run_once()
         except Exception as e:
-            log.error(f"خطای کلی: {e}")
-        time.sleep(CHECK_INTERVAL_SECONDS)
+            log.exception("خطای غیرمنتظره در حلقه‌ی اصلی: %s", e)
+        await asyncio.sleep(CHECK_INTERVAL_MINUTES * 60)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main_loop())
