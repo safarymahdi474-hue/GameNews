@@ -68,7 +68,7 @@ RSS_FEEDS = {
     "PC Gamer": "https://www.pcgamer.com/rss/",
 }
 
-GEMINI_MODEL_NAME = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_MODEL_NAME = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
 
 logging.basicConfig(
     level=logging.INFO,
