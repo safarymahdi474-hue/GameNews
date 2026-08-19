@@ -25,6 +25,7 @@ import json
 import random
 import logging
 import re
+import asyncio
 
 import feedparser
 import requests
@@ -68,7 +69,7 @@ RSS_FEEDS = {
     "PC Gamer": "https://www.pcgamer.com/rss/",
 }
 
-GEMINI_MODEL_NAME = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
+GEMINI_MODEL_NAME = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -377,6 +378,7 @@ async def check_for_news(context: ContextTypes.DEFAULT_TYPE) -> None:
             continue
 
         await send_draft(context.bot, item, rewritten)
+        await asyncio.sleep(2)  # فاصله‌ی کوتاه بین درخواست‌های Gemini برای رعایت محدودیت RPM
 
     save_sent_links(sent_links)
 
