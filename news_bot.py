@@ -190,18 +190,20 @@ GEMINI_PROMPT = """
    داشته باشه — ولی زیاده‌روی نکن (در کل متن حداکثر ۴-۶ ایموجی، نه بیشتر، و
    هیچ‌وقت ایموجی پشت‌سرهم توی یک جا).
 
-3. متن نهایی باید ۳ تا ۵ جمله‌ی کوتاه، خوش‌ریتم و خوش‌خوان باشه، نه یک پاراگراف
-   طولانی و خسته‌کننده. هر جمله باید حس هیجان و تازگیِ خبر رو منتقل کنه، انگار
-   داری برای یه دوست گیمر تعریف می‌کنی، نه این‌که داری گزارش رسمی می‌نویسی.
+3. متن نهایی باید **خلاصه و فشرده** باشه — فقط ۲ تا ۳ جمله‌ی کوتاه و خوش‌ریتم،
+   فقط نکته‌ی اصلیِ خبر. جزئیات حاشیه‌ای، توضیحات تکراری، پس‌زمینه‌ی غیرضروری،
+   یا نقل‌قول‌های طولانی رو کامل حذف کن. در عین حال نباید آنقدر کوتاه بشه که
+   خبر گنگ یا ناقص به‌نظر برسه — فقط خلاصه، نه سرسری. هر جمله باید حس هیجان و
+   تازگیِ خبر رو منتقل کنه، انگار داری برای یه دوست گیمر تعریف می‌کنی، نه
+   این‌که داری گزارش رسمی می‌نویسی.
 
-4. سه تا پنج هشتگ مرتبط فارسی/انگلیسی هم پیشنهاد بده (مثل #گیم #PS5 #بازی_جدید).
+4. هیچ هشتگی به متن اضافه نکن.
 
 فقط و فقط یک JSON خام با این ساختار برگردون، بدون توضیح اضافه و بدون ```:
 {{
   "is_worth_posting": true/false,
   "title_fa": "عنوان جذاب فارسی",
-  "body_fa": "متن جذاب فارسی",
-  "hashtags": ["#تگ۱", "#تگ۲"]
+  "body_fa": "متن خلاصه‌شده‌ی جذاب فارسی"
 }}
 
 عنوان خبر: {title}
@@ -224,9 +226,14 @@ def rewrite_with_gemini(item: dict) -> dict | None:
         return None
 
 
-def build_caption(rewritten: dict) -> str:
-    caption = f"<b>{rewritten['title_fa']}</b>\n\n{rewritten['body_fa']}\n\n"
-    caption += " ".join(rewritten.get("hashtags", []))
+# این امضا فقط موقع انتشار نهایی در کانال اصلی اضافه می‌شه (نه تو پیش‌نویس)
+CHANNEL_SIGNATURE = "𝐈𝐃 : @HiromiyaStudio"
+
+
+def build_caption(rewritten: dict, with_signature: bool = False) -> str:
+    caption = f"<b>{rewritten['title_fa']}</b>\n\n{rewritten['body_fa']}"
+    if with_signature:
+        caption += f"\n\n<blockquote>{CHANNEL_SIGNATURE}</blockquote>"
     return caption
 
 
@@ -280,7 +287,6 @@ async def send_draft(bot, item: dict, rewritten: dict) -> None:
     drafts[str(msg.message_id)] = {
         "title_fa": rewritten["title_fa"],
         "body_fa": rewritten["body_fa"],
-        "hashtags": rewritten.get("hashtags", []),
         "image_url": image_url,
         "source_link": item["link"],
     }
@@ -316,9 +322,8 @@ async def handle_post_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     rewritten = {
         "title_fa": draft["title_fa"],
         "body_fa": draft["body_fa"],
-        "hashtags": draft["hashtags"],
     }
-    caption = build_caption(rewritten)
+    caption = build_caption(rewritten, with_signature=True)
     image_url = draft.get("image_url")
     bot = context.bot
 
