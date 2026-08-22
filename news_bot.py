@@ -13,9 +13,14 @@
    (DRAFT_GROUP_ID) می‌فرسته.
 5) هر عضو گروه با ریپلای‌کردن روی همون پیش‌نویس و نوشتن دستور /post، خبر رو
    (همراه با یک استیکر گیمینگ تصادفی) به کانال اصلی (CHANNEL_ID) منتشر می‌کنه.
-6) برای جلوگیری از پردازش دوباره‌ی یک خبر، لینک خبرهای بررسی‌شده تو
-   sent_news.json نگه داشته می‌شه. پیش‌نویس‌های در انتظار تأیید هم تو
-   pending_drafts.json ذخیره می‌شن تا با ری‌استارت ربات از دست نرن.
+6) قبل از فرستادن هر خبر به Gemini، عنوانش با موضوع‌های اخیر و بقیه‌ی خبرهای
+   همون دور مقایسه می‌شه؛ اگه چند رسانه (IGN، GameSpot و...) یک خبر رو با
+   عنوان مشابه پوشش داده باشن، فقط اولی پردازش می‌شه و بقیه بدون مصرف توکن
+   Gemini رد می‌شن.
+7) برای جلوگیری از پردازش دوباره‌ی یک خبر، لینک خبرهای بررسی‌شده تو
+   sent_news.json و موضوع‌هاشون تو sent_topics.json نگه داشته می‌شه.
+   پیش‌نویس‌های در انتظار تأیید هم تو pending_drafts.json ذخیره می‌شن تا با
+   ری‌استارت ربات از دست نرن.
 
 با DRY_RUN=1 می‌تونی بدون ارسال واقعی، فقط تو کنسول ببینی خروجی چطوریه.
 """
@@ -60,7 +65,13 @@ MAX_ITEMS_PER_RUN = int(os.environ.get("MAX_ITEMS_PER_RUN", "5"))
 DRY_RUN = os.environ.get("DRY_RUN", "0") == "1"
 
 SENT_NEWS_FILE = "sent_news.json"
+SENT_TOPICS_FILE = "sent_topics.json"
 PENDING_DRAFTS_FILE = "pending_drafts.json"
+
+# چند تا موضوعِ اخیر برای مقایسه‌ی شباهت نگه داشته بشه (برای جلوگیری از رشد بی‌نهایت فایل)
+MAX_STORED_TOPICS = 400
+# چه‌قدر شباهتِ کلمات کلیدیِ دو عنوان لازمه تا «همون خبر» در نظر گرفته بشن (۰ تا ۱)
+TOPIC_SIMILARITY_THRESHOLD = 0.5
 
 RSS_FEEDS = {
     "IGN": "https://feeds.ign.com/ign/games-all",
@@ -113,6 +124,49 @@ def load_pending_drafts() -> dict:
 
 def save_pending_drafts(drafts: dict) -> None:
     _save_json(PENDING_DRAFTS_FILE, drafts)
+
+
+def load_sent_topics() -> list:
+    return _load_json(SENT_TOPICS_FILE, [])
+
+
+def save_sent_topics(topics: list) -> None:
+    # فقط آخرین‌ها رو نگه می‌داریم که فایل بی‌نهایت بزرگ نشه
+    _save_json(SENT_TOPICS_FILE, topics[-MAX_STORED_TOPICS:])
+
+
+# ---------------------------------------------------------------------------
+# تشخیص خبرهای تکراری/مشابه (چند رسانه یک خبر رو پوشش داده باشن)
+# ---------------------------------------------------------------------------
+
+_STOPWORDS = {
+    "the", "a", "an", "is", "are", "was", "were", "to", "of", "in", "on",
+    "for", "and", "with", "at", "by", "from", "as", "its", "it", "this",
+    "that", "new", "will", "has", "have", "be", "after", "how", "what",
+    "why", "get", "gets", "you", "your",
+}
+
+
+def extract_keywords(title: str) -> set:
+    words = re.findall(r"[a-zA-Z0-9']+", title.lower())
+    return {w for w in words if len(w) > 2 and w not in _STOPWORDS}
+
+
+def topic_similarity(words_a: set, words_b: set) -> float:
+    """ضریب هم‌پوشانی نسبت به کوچک‌ترین مجموعه — برای عنوان‌های هم‌طول نامساوی
+    (که رسانه‌های مختلف معمولاً دارن) بهتر از Jaccard جواب می‌ده."""
+    if not words_a or not words_b:
+        return 0.0
+    intersection = len(words_a & words_b)
+    return intersection / min(len(words_a), len(words_b))
+
+
+def is_duplicate_topic(title: str, known_topics: list) -> bool:
+    words = extract_keywords(title)
+    for known in known_topics:
+        if topic_similarity(words, set(known)) >= TOPIC_SIMILARITY_THRESHOLD:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -232,7 +286,7 @@ CHANNEL_SIGNATURE = "𝐈𝐃 : @HiromiyaStudio"
 
 
 def build_caption(rewritten: dict, with_signature: bool = False) -> str:
-    caption = f"<b>{rewritten['title_fa']}</b>\n\n{rewritten['body_fa']}"
+    caption = f"<blockquote><b>{rewritten['title_fa']}</b></blockquote>\n\n{rewritten['body_fa']}"
     if with_signature:
         caption += f"\n\n<blockquote>{CHANNEL_SIGNATURE}</blockquote>"
     return caption
@@ -359,19 +413,42 @@ async def handle_post_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def check_for_news(context: ContextTypes.DEFAULT_TYPE) -> None:
     sent_links = load_sent_links()
+    sent_topics = load_sent_topics()
     entries = fetch_latest_entries()
 
-    new_entries = [e for e in entries if e["link"] and e["link"] not in sent_links]
-    new_entries = new_entries[:MAX_ITEMS_PER_RUN]
+    candidates = [e for e in entries if e["link"] and e["link"] not in sent_links]
+
+    # حذف خبرهای تکراری/مشابه (چند رسانه یک خبر رو پوشش داده باشن) قبل از
+    # مصرف توکن Gemini — هم نسبت به موضوع‌های قبلاً پردازش‌شده، هم بین
+    # خودِ خبرهای همین دور بررسی.
+    unique_entries = []
+    seen_this_run = []
+    for entry in candidates:
+        if is_duplicate_topic(entry["title"], sent_topics) or is_duplicate_topic(
+            entry["title"], seen_this_run
+        ):
+            log.info(
+                "خبر مشابه/تکراری رد شد (بدون مصرف Gemini): [%s] %s",
+                entry["source"],
+                entry["title"],
+            )
+            sent_links.add(entry["link"])  # دیگه هیچ‌وقت دوباره چک نشه
+            continue
+        unique_entries.append(entry)
+        seen_this_run.append(extract_keywords(entry["title"]))
+
+    new_entries = unique_entries[:MAX_ITEMS_PER_RUN]
 
     if not new_entries:
         log.info("خبر جدیدی نبود.")
+        save_sent_links(sent_links)
         return
 
     for item in new_entries:
         log.info("در حال بررسی: [%s] %s", item["source"], item["title"])
         rewritten = rewrite_with_gemini(item)
         sent_links.add(item["link"])  # چه پیش‌نویس بشه چه رد بشه، دوباره چک نمی‌شه
+        sent_topics.append(list(extract_keywords(item["title"])))
 
         if not rewritten or not rewritten.get("is_worth_posting"):
             log.info("رد شد (کم‌ارزش یا خطا): %s", item["title"])
@@ -381,6 +458,7 @@ async def check_for_news(context: ContextTypes.DEFAULT_TYPE) -> None:
         await asyncio.sleep(2)  # فاصله‌ی کوتاه بین درخواست‌های Gemini برای رعایت محدودیت RPM
 
     save_sent_links(sent_links)
+    save_sent_topics(sent_topics)
 
 
 # ---------------------------------------------------------------------------
