@@ -6,18 +6,20 @@
    جدیدترین خبرها رو می‌گیره (اخبار انیمه پیگیری نمی‌شه).
 2) هر خبر رو به Gemini می‌ده تا:
    - تشخیص بده خبر ارزش انتشار داره یا نه (تخفیف/لیست/ریویو صرف = رد بشه)
-   - عنوان و متن رو به فارسیِ روان، جذاب و با ایموجی‌های کیبورد بازنویسی کنه
-   - چند هشتگ مرتبط پیشنهاد بده
+   - عنوان و متن رو به فارسیِ روان، جذاب، خلاصه و با ایموجی‌های کیبورد بازنویسی کنه
 3) عکس خبر رو پیدا می‌کنه.
-4) به‌جای ارسال مستقیم، خبرِ آماده رو به‌عنوان **پیش‌نویس** به گروه پیش‌نویس
+4) اگه خبر ویدیو هم داشته باشه (مثل تریلر)، اون هم اضافه می‌شه: اگه فایل
+   ویدیوی مستقیم باشه، واقعاً به‌عنوان ویدیو تو تلگرام آپلود می‌شه؛ اگه لینک
+   صفحه‌ای مثل یوتیوب باشه، به‌صورت لینک «تماشای ویدیو» زیر متن اضافه می‌شه.
+5) به‌جای ارسال مستقیم، خبرِ آماده رو به‌عنوان **پیش‌نویس** به گروه پیش‌نویس
    (DRAFT_GROUP_ID) می‌فرسته.
-5) هر عضو گروه با ریپلای‌کردن روی همون پیش‌نویس و نوشتن دستور /post، خبر رو
+6) هر عضو گروه با ریپلای‌کردن روی همون پیش‌نویس و نوشتن دستور /post، خبر رو
    (همراه با یک استیکر گیمینگ تصادفی) به کانال اصلی (CHANNEL_ID) منتشر می‌کنه.
-6) قبل از فرستادن هر خبر به Gemini، عنوانش با موضوع‌های اخیر و بقیه‌ی خبرهای
+7) قبل از فرستادن هر خبر به Gemini، عنوانش با موضوع‌های اخیر و بقیه‌ی خبرهای
    همون دور مقایسه می‌شه؛ اگه چند رسانه (IGN، GameSpot و...) یک خبر رو با
    عنوان مشابه پوشش داده باشن، فقط اولی پردازش می‌شه و بقیه بدون مصرف توکن
    Gemini رد می‌شن.
-7) برای جلوگیری از پردازش دوباره‌ی یک خبر، لینک خبرهای بررسی‌شده تو
+8) برای جلوگیری از پردازش دوباره‌ی یک خبر، لینک خبرهای بررسی‌شده تو
    sent_news.json و موضوع‌هاشون تو sent_topics.json نگه داشته می‌شه.
    پیش‌نویس‌های در انتظار تأیید هم تو pending_drafts.json ذخیره می‌شن تا با
    ری‌استارت ربات از دست نرن.
@@ -188,6 +190,7 @@ def fetch_latest_entries() -> list:
                         "html.parser",
                     ).get_text().strip(),
                     "image": extract_image_from_entry(entry),
+                    "video": extract_video_from_entry(entry),
                 })
         except Exception as e:
             log.error("خطا در خوندن فید %s: %s", source_name, e)
@@ -210,6 +213,45 @@ def extract_image_from_entry(entry) -> str | None:
     match = re.search(r'<img[^>]+src="([^"]+)"', html)
     if match:
         return match.group(1)
+    return None
+
+
+def extract_video_from_entry(entry) -> dict | None:
+    """اگه خبر ویدیو (مثل تریلر) داشته باشه، لینکش رو برمی‌گردونه.
+    خروجی: {"url": ..., "is_direct_file": True/False}
+    is_direct_file یعنی فایل ویدیوی مستقیمه (قابل آپلود مستقیم تو تلگرام)،
+    در غیر این‌صورت لینک صفحه‌ست (مثل یوتیوب) و فقط به‌صورت لینک اضافه می‌شه."""
+    # ۱) media_content با نوع ویدیو (بعضی فیدها این‌طوری می‌دن)
+    if hasattr(entry, "media_content") and entry.media_content:
+        for media in entry.media_content:
+            media_type = media.get("type", "") or media.get("medium", "")
+            url = media.get("url")
+            if url and ("video" in media_type or url.lower().endswith((".mp4", ".mov", ".webm"))):
+                return {"url": url, "is_direct_file": True}
+
+    # ۲) enclosure با نوع ویدیو
+    for link in entry.get("links", []):
+        link_type = link.get("type", "")
+        href = link.get("href", "")
+        if link_type.startswith("video") or href.lower().endswith((".mp4", ".mov", ".webm")):
+            return {"url": href, "is_direct_file": True}
+
+    # ۳) ویدیوی امبدشده (یوتیوب/ویمیو) داخل خودِ خبر — این‌ها لینک صفحه‌ان،
+    # نه فایل مستقیم، پس فقط به‌صورت لینک اضافه می‌شن.
+    html = entry.get("summary", "") + str(entry.get("content", ""))
+    yt_match = re.search(
+        r'(?:youtube\.com/(?:embed/|watch\?v=)|youtu\.be/)([a-zA-Z0-9_-]{6,})', html
+    )
+    if yt_match:
+        video_id = yt_match.group(1)
+        return {"url": f"https://www.youtube.com/watch?v={video_id}", "is_direct_file": False}
+
+    iframe_match = re.search(r'<iframe[^>]+src="([^"]+)"', html)
+    if iframe_match and any(
+        domain in iframe_match.group(1) for domain in ("youtube.com", "vimeo.com", "youtu.be")
+    ):
+        return {"url": iframe_match.group(1), "is_direct_file": False}
+
     return None
 
 
@@ -286,10 +328,16 @@ CHANNEL_SIGNATURE = "𝐈𝐃 : @HiromiyaStudio"
 
 
 def build_caption(rewritten: dict, with_signature: bool = False) -> str:
+    """کپشنِ خبرِ معمولی — بدون هیچ اشاره‌ای به ویدیو، چون ویدیو جداگانه فرستاده می‌شه."""
     caption = f"<blockquote><b>{rewritten['title_fa']}</b></blockquote>\n\n{rewritten['body_fa']}"
     if with_signature:
         caption += f"\n\n<blockquote>{CHANNEL_SIGNATURE}</blockquote>"
     return caption
+
+
+def build_video_headline(rewritten: dict) -> str:
+    """کپشنِ کوتاه (فقط یکی دو خط تیتر) برای پیام جداگانه‌ی ویدیو."""
+    return f"<blockquote><b>{rewritten['title_fa']}</b></blockquote>"
 
 
 # ---------------------------------------------------------------------------
@@ -313,13 +361,41 @@ async def get_random_sticker_file_id(bot) -> str | None:
 # فرستادن پیش‌نویس به گروه تأیید
 # ---------------------------------------------------------------------------
 
+async def send_video_followup(bot, chat_id, rewritten: dict, direct_video_url, linked_video_url) -> None:
+    """پیام جداگانه‌ی ویدیو — فقط با تیتر کوتاه (یکی دو خط)، جدا از متن اصلی خبر."""
+    if not direct_video_url and not linked_video_url:
+        return
+    headline = build_video_headline(rewritten)
+    try:
+        if direct_video_url:
+            await bot.send_video(
+                chat_id=chat_id, video=direct_video_url, caption=headline, parse_mode="HTML"
+            )
+        elif linked_video_url:
+            # لینک به‌تنهایی تو متن باشه تا تلگرام خودش پیش‌نمایش ویدیو رو نشون بده
+            await bot.send_message(
+                chat_id=chat_id,
+                text=f"{headline}\n\n{linked_video_url}",
+                parse_mode="HTML",
+            )
+    except TelegramError as e:
+        log.warning("ارسال پیام جداگانه‌ی ویدیو ناموفق بود: %s", e)
+
+
 async def send_draft(bot, item: dict, rewritten: dict) -> None:
+    video = item.get("video")
+    direct_video_url = video["url"] if video and video["is_direct_file"] else None
+    linked_video_url = video["url"] if video and not video["is_direct_file"] else None
+
     caption = build_caption(rewritten)
     image_url = item.get("image") or fetch_og_image(item["link"])
     footer = "\n\n———\n🗂 برای انتشار در کانال، رو همین پیام ریپلای کن و بنویس: /post"
 
     if DRY_RUN:
-        log.info("—— DRY RUN (پیش‌نویس) ——\n%s%s\nعکس: %s\n", caption, footer, image_url)
+        log.info(
+            "—— DRY RUN (پیش‌نویس) ——\n%s%s\nعکس: %s\nویدیوی جداگانه — مستقیم: %s / لینک: %s\n",
+            caption, footer, image_url, direct_video_url, linked_video_url,
+        )
         return
 
     try:
@@ -338,11 +414,16 @@ async def send_draft(bot, item: dict, rewritten: dict) -> None:
         log.error("ارسال پیش‌نویس به گروه ناموفق بود: %s", e)
         return
 
+    # اگه ویدیو داشت، به‌صورت پیامِ جداگانه (فقط تیتر کوتاه) درست بعدِ خبر اصلی فرستاده می‌شه
+    await send_video_followup(bot, DRAFT_GROUP_ID, rewritten, direct_video_url, linked_video_url)
+
     drafts = load_pending_drafts()
     drafts[str(msg.message_id)] = {
         "title_fa": rewritten["title_fa"],
         "body_fa": rewritten["body_fa"],
         "image_url": image_url,
+        "direct_video_url": direct_video_url,
+        "linked_video_url": linked_video_url,
         "source_link": item["link"],
     }
     save_pending_drafts(drafts)
@@ -378,6 +459,8 @@ async def handle_post_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         "title_fa": draft["title_fa"],
         "body_fa": draft["body_fa"],
     }
+    linked_video_url = draft.get("linked_video_url")
+    direct_video_url = draft.get("direct_video_url")
     caption = build_caption(rewritten, with_signature=True)
     image_url = draft.get("image_url")
     bot = context.bot
@@ -400,6 +483,9 @@ async def handle_post_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         log.error("ارسال خبر به کانال ناموفق بود: %s", e)
         await message.reply_text(f"❌ ارسال به کانال ناموفق بود: {e}")
         return
+
+    # ویدیو (اگه بود) به‌صورت پیامِ جداگانه با فقط تیتر کوتاه، درست بعدِ خبر اصلی
+    await send_video_followup(bot, CHANNEL_ID, rewritten, direct_video_url, linked_video_url)
 
     del drafts[draft_id]
     save_pending_drafts(drafts)
